@@ -18,7 +18,7 @@ from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
 
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import generate_placeholder_video
+from blinkbridge.ffmpeg import generate_placeholder_video, probe_stream_shape
 
 
 log = logging.getLogger(__name__)
@@ -115,6 +115,10 @@ class CameraManager:
         self.starting_placeholder_path: Optional[Path] = None
         self.offline_placeholder_path: Optional[Path] = None
         self.error_placeholder_path: Optional[Path] = None
+        # Per-camera placeholder sets, plus the stream shape each was built for
+        # so they can be rebuilt if a camera's clips ever change shape.
+        self.camera_placeholders: Dict[str, Dict[str, Path]] = {}
+        self.camera_placeholder_shapes: Dict[str, Dict] = {}
         self.twofa_provider: Optional[Callable[[], Awaitable[str]]] = None
         self.credentials_provider: Optional[Callable[[], Awaitable[dict]]] = None
 
@@ -338,25 +342,30 @@ class CameraManager:
 
         return False
 
+    # (filename stem, on-screen text, background colour, text colour)
+    PLACEHOLDER_SPECS = {
+        'starting': ('starting_placeholder', 'Starting...', 'gray',  'white'),
+        'offline':  ('offline_placeholder',  'OFFLINE',     'black', 'red'),
+        'error':    ('error_placeholder',    'ERROR',       'black', 'red'),
+    }
+
     def _generate_placeholders(self) -> None:
-        """Generate the three placeholder videos used for camera state display.
+        """Generate the shared fallback placeholder videos.
 
         Creates:
         - starting_placeholder.mp4 : grey screen with white "Starting..." text
         - offline_placeholder.mp4  : black screen with red "OFFLINE" text
         - error_placeholder.mp4    : black screen with red "ERROR" text
 
-        All videos are 1920x1080 H264 at 15 fps to be codec-compatible with
-        real Blink clips in the concat stream.
+        These are 1920x1080 H264 at 15 fps and are only used for a camera that
+        has not produced a clip yet, since there is nothing to match against at
+        that point. Once a clip exists, get_placeholder() serves a per-camera
+        set built to that camera's stream shape instead.
         """
         duration = CONFIG['still_video_duration']
-        specs = [
-            ('starting_placeholder.mp4', 'Starting...', 'gray',  'white', 'starting_placeholder_path'),
-            ('offline_placeholder.mp4',  'OFFLINE',     'black',  'red',  'offline_placeholder_path'),
-            ('error_placeholder.mp4',    'ERROR',       'black',  'red',  'error_placeholder_path'),
-        ]
-        for filename, text, bg, fg, attr in specs:
-            path = PATH_VIDEOS / filename
+        for state, (stem, text, bg, fg) in self.PLACEHOLDER_SPECS.items():
+            path = PATH_VIDEOS / f"{stem}.mp4"
+            attr = f"{state}_placeholder_path"
             if path.exists():
                 log.debug(f"Placeholder already exists: {path}")
                 setattr(self, attr, path)
@@ -374,7 +383,90 @@ class CameraManager:
             if ok:
                 setattr(self, attr, path)
             else:
-                log.error(f"Failed to generate placeholder video: {filename}")
+                log.error(f"Failed to generate placeholder video: {path.name}")
+
+    def get_placeholder(self, state: str, camera_name: str) -> Optional[Path]:
+        """Return the placeholder video for a camera state, matched to that camera.
+
+        Placeholders share a concat stream with the camera's real clips, and
+        FFmpeg publishes that stream with -c copy, so the RTSP SDP is written
+        once from whatever plays first and never updated. A placeholder whose
+        resolution, frame rate, H264 profile/level or audio layout differs from
+        the camera's clips therefore leaves the published stream describing
+        something other than what it carries, which breaks readers such as
+        Frigate. So each camera gets its own placeholder set, built from the
+        shape of its most recent clip.
+
+        Before a camera has downloaded a clip there is nothing to match, so the
+        shared 1920x1080 fallback is returned; StreamServer restarts the
+        publisher when the first real clip changes the stream shape, which
+        re-writes the SDP.
+
+        Args:
+            state: One of 'starting', 'offline', 'error'.
+            camera_name: Camera the placeholder is for.
+
+        Returns:
+            Path to a placeholder video, or None if none could be produced.
+        """
+        fallback = getattr(self, f"{state}_placeholder_path", None)
+        if state not in self.PLACEHOLDER_SPECS:
+            log.warning(f"{camera_name}: unknown placeholder state '{state}'")
+            return fallback
+
+        camera_name_sanitized = camera_name.replace(' ', '_').lower()
+        reference = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
+        if not reference.exists():
+            return fallback
+
+        shape = probe_stream_shape(reference)
+        if shape is None:
+            return fallback
+
+        if self.camera_placeholder_shapes.get(camera_name) != shape:
+            self._generate_camera_placeholders(camera_name, camera_name_sanitized, shape)
+
+        return self.camera_placeholders.get(camera_name, {}).get(state, fallback)
+
+    def _generate_camera_placeholders(
+        self, camera_name: str, camera_name_sanitized: str, shape: Dict
+    ) -> None:
+        """Build this camera's placeholder set for the given stream shape.
+
+        Called only when the shape differs from the set already on disk, so a
+        camera that keeps producing clips of the same shape encodes its
+        placeholders once.
+        """
+        duration = CONFIG['still_video_duration']
+        generated: Dict[str, Path] = {}
+
+        for state, (stem, text, bg, fg) in self.PLACEHOLDER_SPECS.items():
+            path = PATH_VIDEOS / f"{camera_name_sanitized}_{stem}.mp4"
+            ok = generate_placeholder_video(
+                output_path=path,
+                text=text,
+                bg_color=bg,
+                text_color=fg,
+                duration=duration,
+                **shape,
+            )
+            if ok:
+                generated[state] = path
+            else:
+                log.error(f"{camera_name}: failed to generate {state} placeholder")
+
+        if len(generated) == len(self.PLACEHOLDER_SPECS):
+            self.camera_placeholders[camera_name] = generated
+            self.camera_placeholder_shapes[camera_name] = shape
+            log.info(
+                f"{camera_name}: placeholders rebuilt for {shape['width']}x{shape['height']} "
+                f"@ {shape['fps']}, audio {shape['audio_rate']}Hz/{shape['audio_channels']}ch"
+            )
+        else:
+            # Partial sets would reintroduce the mismatch on whichever state
+            # failed, so discard and keep using the shared fallback.
+            self.camera_placeholders.pop(camera_name, None)
+            self.camera_placeholder_shapes.pop(camera_name, None)
 
     def _detect_resolution_from_clips(self) -> Tuple[int, int]:
         """Detect resolution from clips. Returns default Blink resolution (1920x1080).
