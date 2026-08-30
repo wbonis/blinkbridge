@@ -17,6 +17,7 @@ from rich.logging import RichHandler
 
 from blinkbridge.blink import CameraManager
 from blinkbridge.config import *
+from blinkbridge.ffmpeg import probe_stream_shape
 from blinkbridge.stream_server import StreamServer
 from blinkbridge.web import BlinkBridgeWebServer
 
@@ -260,8 +261,13 @@ class Application:
         rtsp_host = str(export_cfg.get('rtsp_host', CONFIG['rtsp_server']['address']))
         rtsp_port = int(export_cfg.get('rtsp_port', CONFIG['rtsp_server']['port']))
         detect_defaults = dict(export_cfg.get('detect_defaults', {}))
-        width = int(detect_defaults.get('width', 1280))
-        height = int(detect_defaults.get('height', 720))
+        # No built-in fallback dimensions: an unset default means "let Frigate
+        # work it out", which is safer than a guess that happens to be wrong
+        # for this camera. See the per-camera loop below.
+        width = detect_defaults.get('width')
+        height = detect_defaults.get('height')
+        width = int(width) if width else None
+        height = int(height) if height else None
         fps = int(detect_defaults.get('fps', 1))
 
         lines = [
@@ -272,6 +278,24 @@ class Application:
 
         for camera_name in camera_names:
             camera_key = camera_name.replace(' ', '_').lower()
+
+            # Detect geometry: measured beats configured beats omitted. Blink
+            # models differ in resolution (720p through 1440p), so writing the
+            # configured detect_defaults for every camera would hand Frigate
+            # the wrong frame geometry for any camera that isn't that size --
+            # and silently mask the very mismatch this export exists to
+            # surface. Measure it from the camera's own most recent clip; fall
+            # back to the configured defaults only when there is no clip to
+            # measure; and when there is neither, write no dimensions at all so
+            # Frigate reads them off the stream itself rather than trusting a
+            # guess. detect fps stays configured: that's Frigate's analysis
+            # rate, not the stream's.
+            shape = probe_stream_shape(PATH_VIDEOS / f"{camera_key}_latest.mp4")
+            if shape is not None:
+                cam_width, cam_height = shape['width'], shape['height']
+            else:
+                cam_width, cam_height = width, height
+
             lines.append(f"  {camera_key}:")
             lines.append("    ffmpeg:")
             lines.append("      inputs:")
@@ -281,8 +305,11 @@ class Application:
                 lines.append(f"            - {role}")
             lines.append("    detect:")
             lines.append("      enabled: true")
-            lines.append(f"      width: {width}")
-            lines.append(f"      height: {height}")
+            if cam_width and cam_height:
+                lines.append(f"      width: {cam_width}")
+                lines.append(f"      height: {cam_height}")
+            else:
+                lines.append("      # width/height omitted -- Frigate reads them from the stream")
             lines.append(f"      fps: {fps}")
 
         output_path = Path(str(export_cfg.get('output_path', PATH_CONFIG / 'frigate_cameras.yml')))
