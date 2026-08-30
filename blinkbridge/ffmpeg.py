@@ -42,6 +42,56 @@ def _find_system_font() -> Optional[str]:
     return None
 
 
+def probe_stream_shape(video_file: Union[str, Path]) -> Optional[Dict]:
+    """Return the stream properties that end up in a published RTSP SDP.
+
+    FFmpeg publishes the concat stream with -c copy, so it writes the SDP once
+    from the first file it opens and never revises it. Resolution, frame rate,
+    H264 profile/level and the audio layout are all described there, which
+    makes them the properties every file in one camera's concat stream has to
+    agree on. Anything else (bitrate, pixel format, clip length) can vary
+    freely.
+
+    Returns:
+        Dict with width, height, fps, profile, level, audio_rate and
+        audio_channels, or None if the file can't be probed or has no H264
+        stream. Values are normalised to what FFmpeg's encoder flags expect,
+        e.g. ffprobe's level 40 becomes '4.0'.
+    """
+    # Checked here rather than left to StreamParameters, which logs a missing
+    # file at ERROR. A camera that hasn't downloaded a clip yet is normal for
+    # this function's callers, not an error.
+    if not Path(video_file).exists():
+        return None
+
+    try:
+        params_audio, params_video = StreamParameters(video_file).wait()
+    except Exception as e:
+        log.debug(f"probe_stream_shape: cannot probe {video_file}: {e}")
+        return None
+
+    if not params_video:
+        log.debug(f"probe_stream_shape: no H264 stream in {video_file}")
+        return None
+
+    try:
+        level = f"{int(params_video['level']) / 10:.1f}"
+    except (KeyError, TypeError, ValueError):
+        level = '4.1'
+
+    profile = str(params_video.get('profile', 'high')).lower().replace(' ', '')
+
+    return {
+        'width': int(params_video['width']),
+        'height': int(params_video['height']),
+        'fps': params_video.get('r_frame_rate', '15/1'),
+        'profile': profile,
+        'level': level,
+        'audio_rate': int(params_audio.get('sample_rate', 44100)) if params_audio else 44100,
+        'audio_channels': int(params_audio.get('channels', 2)) if params_audio else 2,
+    }
+
+
 def generate_placeholder_video(
     output_path: Union[str, Path],
     text: str,
@@ -51,12 +101,26 @@ def generate_placeholder_video(
     height: int = 1080,
     fps: int = 15,
     duration: float = 1.0,
+    profile: str = 'high',
+    level: str = '4.1',
+    audio_rate: int = 44100,
+    audio_channels: int = 2,
 ) -> bool:
     """Generate a short placeholder video with a solid background and centered text.
 
     Used to produce the Starting, Offline, and Error screen videos. All output
     videos are H264/AAC at the given resolution so they are codec-compatible
     with real Blink clips in the concat stream.
+
+    Codec-compatible is not enough on its own: the placeholder shares a concat
+    stream with the camera's real clips, and FFmpeg publishes that stream with
+    -c copy, so the RTSP SDP is written once from whatever plays first and is
+    never updated afterwards. Resolution, frame rate, H264 profile/level and
+    the audio layout all end up in that SDP, so a placeholder that differs in
+    any of them leaves the stream describing something other than what it
+    carries. Callers therefore pass the parameters of the camera the
+    placeholder belongs to; the defaults are only a fallback for a camera that
+    has not produced a clip yet.
 
     Args:
         output_path: Destination file path for the generated video.
@@ -67,6 +131,10 @@ def generate_placeholder_video(
         height: Frame height in pixels (default: 1080).
         fps: Frames per second (default: 15).
         duration: Duration of the video in seconds (default: 1.0).
+        profile: H264 profile to encode with (default: 'high').
+        level: H264 level, as FFmpeg spells it, e.g. '4.0' (default: '4.1').
+        audio_rate: Audio sample rate in Hz (default: 44100).
+        audio_channels: Audio channel count (default: 2).
 
     Returns:
         True if the video was created successfully, False otherwise.
@@ -92,13 +160,16 @@ def generate_placeholder_video(
         vf = None
         log.warning("generate_placeholder_video: no system font found, skipping text overlay")
 
+    channel_layout = 'mono' if int(audio_channels) == 1 else 'stereo'
+
     ffmpeg_cmd = [
         'ffmpeg', *COMMON_FFMPEG_ARGS,
         '-f', 'lavfi', '-i', f"color={bg_color}:size={width}x{height}:rate={fps}",
-        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-        '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1',
+        '-f', 'lavfi',
+        '-i', f"anullsrc=channel_layout={channel_layout}:sample_rate={audio_rate}",
+        '-c:v', 'libx264', '-profile:v', str(profile), '-level:v', str(level),
         '-pix_fmt', 'yuv420p', '-b:v', '500k',
-        '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '64k',
+        '-c:a', 'aac', '-ar', str(audio_rate), '-ac', str(audio_channels), '-b:a', '64k',
         '-t', str(duration),
         '-movflags', 'faststart',
     ]

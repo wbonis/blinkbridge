@@ -79,7 +79,20 @@ class Application:
             log.debug(f"{camera_name}: skipping stream start (shutdown in progress)")
             return None
 
-        starting_video = self.cam_manager.starting_placeholder_path
+        # Fetch a clip before opening the stream. FFmpeg publishes with -c copy,
+        # so it writes the RTSP SDP once from the very first file it plays and
+        # never revises it; whatever shape that file has is what readers are
+        # told the stream is, for as long as it runs. Having a clip on disk
+        # first lets get_placeholder() build a Starting screen at this camera's
+        # own resolution, frame rate and audio layout, so the announced stream
+        # still matches once the camera goes LIVE. The monitoring loop would
+        # fetch this clip a poll later anyway.
+        try:
+            await self.cam_manager.save_latest_clip(camera_name)
+        except Exception as e:
+            log.debug(f"{camera_name}: no clip available before stream start: {e}")
+
+        starting_video = self.cam_manager.get_placeholder('starting', camera_name)
         if starting_video is None:
             log.error(f"{camera_name}: starting placeholder not available, cannot start stream")
             return None
@@ -443,10 +456,12 @@ class Application:
 
         # --- Step 3: state transitions ---
 
-        # Helper shorthands
-        offline_video  = self.cam_manager.offline_placeholder_path
-        starting_video = self.cam_manager.starting_placeholder_path
-        error_video    = self.cam_manager.error_placeholder_path
+        # Helper shorthands. Resolved per camera so the placeholder matches
+        # this camera's stream shape and swapping to it needs no publisher
+        # restart (see CameraManager.get_placeholder).
+        offline_video  = self.cam_manager.get_placeholder('offline', camera_name)
+        starting_video = self.cam_manager.get_placeholder('starting', camera_name)
+        error_video    = self.cam_manager.get_placeholder('error', camera_name)
 
         if is_offline:
             if current_state != CameraState.OFFLINE:

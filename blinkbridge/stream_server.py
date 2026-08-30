@@ -8,10 +8,10 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import StillVideoCreator
+from blinkbridge.ffmpeg import StillVideoCreator, probe_stream_shape
 from blinkbridge.utils import wait_until_file_open
 
 
@@ -42,6 +42,8 @@ class StreamServer:
         self.current_still_video: Optional[Path] = None
         self.process: Optional[subprocess.Popen] = None
         self.failure_detected: bool = False  # True after first failure spotted, until restart attempted
+        # Stream shape the running FFmpeg publisher wrote its RTSP SDP from.
+        self.published_shape: Optional[Dict] = None
 
     def _run_server(self) -> str:
         """Start the FFmpeg RTSP streaming process.
@@ -168,7 +170,58 @@ class StreamServer:
             log.error(f"{self.stream_name}: unexpected error enqueueing clip: {e}")
             raise
 
+        self._reconcile_published_shape(video_file_name)
+
         return next_concat
+
+    def _reconcile_published_shape(self, video_file_name: Path) -> None:
+        """Warn when a newly queued clip no longer matches the published stream.
+
+        FFmpeg publishes with -c copy, so it derives the RTSP SDP from the first
+        file it opens and never revises it. When a later file in the concat
+        stream has a different resolution, frame rate, H264 profile/level or
+        audio layout, the SDP keeps describing the old one and readers decode
+        against the wrong parameters -- which is what makes Frigate drop the
+        session and reconnect in a loop.
+
+        Restarting FFmpeg here would re-publish with a correct SDP, but an
+        in-place restart proved unreliable: the replacement publisher goes
+        quiet after a few seconds and sits in CLOSE_WAIT, alive enough that
+        is_running() keeps reporting it healthy while the path is gone. So this
+        only reports the mismatch. The mismatch is instead avoided upstream:
+        placeholders are built per camera from that camera's own clip (see
+        CameraManager.get_placeholder), and start_stream() fetches a clip
+        before opening the stream so the publisher starts at the right shape.
+        What remains is a camera that has never produced a clip and later does,
+        which this logs so the operator can restart it deliberately.
+        """
+        shape = probe_stream_shape(video_file_name)
+        if shape is None:
+            return
+
+        if self.published_shape is None:
+            self.published_shape = shape
+            return
+
+        if shape == self.published_shape:
+            return
+
+        log.warning(
+            f"{self.stream_name}: stream shape changed "
+            f"({self._describe_shape(self.published_shape)} -> {self._describe_shape(shape)}); "
+            f"the published RTSP description still announces the old shape, "
+            f"restart this stream to republish it"
+        )
+        self.published_shape = shape
+
+    @staticmethod
+    def _describe_shape(shape: Dict) -> str:
+        """Render a stream shape for log output."""
+        return (
+            f"{shape['width']}x{shape['height']}@{shape['fps']} "
+            f"{shape['profile']}/{shape['level']} "
+            f"{shape['audio_rate']}Hz/{shape['audio_channels']}ch"
+        )
 
     def add_video(self, file_name_input_video: Union[str, Path], still_only: bool=False) -> None:
         """Add a video to the stream and create a still video from its last frame.
