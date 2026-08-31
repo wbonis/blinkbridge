@@ -1,5 +1,7 @@
 {
     "still_video_duration": 0.5,
+    "still_video_fps": null,
+    "clip_repeats": 3,
     "paths": {
       "videos": "/working",
       "concat": "/working",
@@ -40,6 +42,11 @@
       "enabled": true,
       "host": "0.0.0.0",
       "port": 8765
+    },
+    "snapshot_refresh": {
+      "enabled": false,
+      "default_interval_minutes": 0,
+      "per_camera": {}
     },
     "log_level": "INFO"
 }

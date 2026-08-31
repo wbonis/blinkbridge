@@ -1,25 +1,54 @@
 services:
   blinkbridge:
     build: .
-    # image: rogerdammit/blinkbridge
+    # image: blinkbridge:local   # built locally from this checkout (upstream: dynacylabs/blinkbridge)
+    container_name: blinkbridge
+    restart: unless-stopped
     ports:
-      - 8765:8765
+      - 8765:8765   # Web-UI (2FA-Code, Login, Status-Dashboard)
     volumes:
       - ./config:/config
-      # RAM-backed tmpfs for temporary files (video clips, concat files, stills).
-      # 256MB is sufficient for 25 cameras at maximum workload (~190MB peak).
-      # Increase if you see ENOSPC errors in the logs.
-      - type: tmpfs
-        target: /working
-        tmpfs:
-          size: 268435456  # 256MB
-      # Bind-mount alternative (disk-backed, slower but survives restarts):
-      # - /tmp/blinkbridge:/working
+      # 2026-08-30: deliberately a bind mount rather than the container tmpfs
+      # upstream uses here. /tmp on this host is itself a tmpfs
+      # (1.9G, "mount | grep ' /tmp '"), so this is already in RAM -- the
+      # container tmpfs would only have lowered the ceiling to 256M and wiped
+      # /working on every "up -d". blinkbridge depends on that directory
+      # surviving: save_latest_clip() (blink.py) reuses an existing
+      # <camera>_latest.mp4 without re-downloading and falls back to it when a
+      # download fails. Without that file get_placeholder() cannot measure the
+      # stream shape at startup and reverts to the generic 1920x1080
+      # placeholder -> wrong SDP -> Frigate drops the session.
+      # To restore upstream behaviour, replace this mount with the tmpfs block
+      # (type: tmpfs, target: /working, size: 268435456).
+      - /tmp/blinkbridge:/working
     tty: true # for color logs
     environment:
       - BLINKBRIDGE_CONFIG=/config/config.json
+      # Without this the container runs on UTC while the host is CEST, so every
+      # log timestamp is two hours off from anything you compare it against --
+      # host clock, Frigate's UI, the Blink app. zoneinfo is already in the
+      # image (ffmpeg pulls it in), so only the variable is needed.
+      - TZ=Europe/Berlin
   mediamtx:
     image: bluenviron/mediamtx
     container_name: mediamtx
+    restart: unless-stopped
+    environment:
+      # 2026-08-30: forces TCP for publishers AND readers. Without it
+      # blinkbridge's ffmpeg publishes over UDP and 1440p frames arrive torn
+      # ("invalid FU-A packet"). To revert, drop these two lines.
+      - MTX_RTSPTRANSPORTS=tcp
+      # 2026-08-31: raise the per-reader write queue (default 512 packets,
+      # must be a power of two). A single 1440p keyframe split into 1200-byte
+      # RTP packets can overflow the default queue in one burst, which MediaMTX
+      # reports as "reader is too slow, discarding N frames" against the
+      # Frigate readers. To revert, drop this line.
+      - MTX_WRITEQUEUESIZE=2048
+      - TZ=Europe/Berlin
+    volumes:
+      # This image carries no zoneinfo of its own, so TZ alone would leave its
+      # Go runtime on UTC. Correlating its session logs against blinkbridge's is
+      # most of what they are read for, so both need the same clock.
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
     ports:
       - 8554:8554

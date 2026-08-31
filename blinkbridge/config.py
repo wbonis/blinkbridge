@@ -135,6 +135,18 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         # Set defaults for optional settings
         CONFIG.setdefault('log_level', 'INFO')
         CONFIG.setdefault('still_video_duration', 0.5)
+        # How many times a motion clip plays before the still takes over. 1 is
+        # the historical behaviour: the still replaced the clip about a second
+        # after it was queued, so the clip played exactly once. A detector
+        # downstream gets only that single pass to recognise anything, which
+        # measured too short here -- Frigate produced no event from a 15 s clip
+        # while producing them from the same clip left looping.
+        CONFIG.setdefault('clip_repeats', 3)
+        # Frame rate to encode the looping still at. None inherits the clip's
+        # rate. Forcing it low decouples the still's length from its encode
+        # cost, which matters because a longer still is what keeps the
+        # publisher from crossing a concat boundary several times a second.
+        CONFIG.setdefault('still_video_fps', None)
         CONFIG['cameras'].setdefault('enabled', [])
         CONFIG['cameras'].setdefault('disabled', [])
         CONFIG['cameras'].setdefault('max_failures', 3)
@@ -150,9 +162,24 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['frigate_export'].setdefault('rtsp_port', CONFIG['rtsp_server']['port'])
         CONFIG['frigate_export'].setdefault('roles', ['detect', 'record'])
         CONFIG['frigate_export'].setdefault('detect_defaults', {})
-        CONFIG['frigate_export']['detect_defaults'].setdefault('width', 1280)
-        CONFIG['frigate_export']['detect_defaults'].setdefault('height', 720)
+        # No width/height defaults on purpose: the export measures each camera's
+        # real resolution and only falls back to these. Injecting 1280x720 here
+        # would turn "unset" into a guess that is wrong for any other model.
         CONFIG['frigate_export']['detect_defaults'].setdefault('fps', 1)
+
+        # Optional periodic refresh of the looping still from a fresh camera
+        # snapshot. Each refresh wakes the camera, which costs battery on the
+        # battery-powered models, so nothing runs unless an interval is set:
+        # with the section absent, default_interval_minutes is 0 and per_camera
+        # is empty, which disables it for every camera on its own. 'enabled'
+        # therefore defaults to True rather than False -- it is a master switch
+        # for turning a configured setup off, and defaulting it to False would
+        # only mean that a config setting nothing but intervals silently does
+        # nothing.
+        CONFIG.setdefault('snapshot_refresh', {})
+        CONFIG['snapshot_refresh'].setdefault('enabled', True)
+        CONFIG['snapshot_refresh'].setdefault('default_interval_minutes', 0)
+        CONFIG['snapshot_refresh'].setdefault('per_camera', {})
 
         # Optional BlinkBridge utility web server
         CONFIG.setdefault('web', {})

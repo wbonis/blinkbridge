@@ -4,6 +4,7 @@ Provides functions to interact with Linux /proc filesystem for monitoring
 process file descriptors and waiting for specific file operations.
 """
 import logging
+import os
 import time
 from pathlib import Path
 from typing import List, Union
@@ -157,6 +158,46 @@ def is_file_open(process_name: str, file_name: Union[str, Path]) -> bool:
                 
     return False
 
+def get_socket_states(pid: int) -> List[str]:
+    """TCP states of the sockets a process holds, as /proc/net/tcp spells them.
+
+    Returns hex state codes ('01' = ESTABLISHED, '08' = CLOSE_WAIT, ...). An
+    empty list means "nothing could be determined" -- no sockets yet, or /proc
+    unreadable -- which callers must distinguish from "sockets exist and none
+    is healthy". A publisher that has not connected yet also has none.
+    """
+    inodes = set()
+    try:
+        fd_dir = Path(f'/proc/{pid}/fd')
+        for fd in fd_dir.iterdir():
+            try:
+                target = os.readlink(fd)
+            except (OSError, PermissionError):
+                continue
+            if target.startswith('socket:['):
+                inodes.add(target[len('socket:['):-1])
+    except (OSError, PermissionError) as e:
+        log.debug(f"Could not list sockets for process {pid}: {e}")
+        return []
+
+    if not inodes:
+        return []
+
+    states = []
+    for table in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(table) as f:
+                next(f, None)  # header
+                for line in f:
+                    parts = line.split()
+                    if len(parts) > 9 and parts[9] in inodes:
+                        states.append(parts[3])
+        except (OSError, StopIteration) as e:
+            log.debug(f"Could not read {table}: {e}")
+
+    return states
+
+
 def wait_until_file_open(file_path: Union[str, Path], pid: int, timeout: float=10.0, poll_interval: float=0.1) -> float:
     """Wait until a file is opened by a specific process.
     
@@ -211,5 +252,13 @@ def wait_until_file_open(file_path: Union[str, Path], pid: int, timeout: float=1
             log.error(f"Error during sleep: {e}")
             break
 
-    log.error(f"Timeout waiting for process {pid} to open {file_path} after {timeout}s")
-    raise TimeoutError(f"Timeout waiting for process {pid} to open {file_path}")
+    # Debug, not error: the only caller treats expiry as a normal outcome and
+    # logs it at warning with the camera name attached. Logging it as an error
+    # here says "something broke" about a wait that is expected to expire.
+    log.debug(f"Timeout waiting for process {pid} to open {file_path} after {timeout}s")
+    raise TimeoutError(
+        f"process {pid} did not open {file_path} within {timeout}s -- "
+        f"the publisher plays the concat in real time, so it only opens a newly "
+        f"queued file once the current one has finished; a clip longer than "
+        f"{timeout}s still playing will exceed this"
+    )

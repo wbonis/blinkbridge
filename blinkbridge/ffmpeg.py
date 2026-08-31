@@ -42,6 +42,130 @@ def _find_system_font() -> Optional[str]:
     return None
 
 
+def probe_stream_shape(video_file: Union[str, Path]) -> Optional[Dict]:
+    """Return the stream properties that end up in a published RTSP SDP.
+
+    FFmpeg publishes the concat stream with -c copy, so it writes the SDP once
+    from the first file it opens and never revises it. Resolution, frame rate,
+    H264 profile/level and the audio layout are all described there, which
+    makes them the properties every file in one camera's concat stream has to
+    agree on. Anything else (bitrate, pixel format, clip length) can vary
+    freely.
+
+    Returns:
+        Dict with width, height, fps, profile, level, audio_rate and
+        audio_channels, or None if the file can't be probed or has no H264
+        stream. Values are normalised to what FFmpeg's encoder flags expect,
+        e.g. ffprobe's level 40 becomes '4.0'.
+    """
+    # Checked here rather than left to StreamParameters, which logs a missing
+    # file at ERROR. A camera that hasn't downloaded a clip yet is normal for
+    # this function's callers, not an error.
+    if not Path(video_file).exists():
+        return None
+
+    try:
+        params_audio, params_video = StreamParameters(video_file).wait()
+    except Exception as e:
+        log.debug(f"probe_stream_shape: cannot probe {video_file}: {e}")
+        return None
+
+    if not params_video:
+        log.debug(f"probe_stream_shape: no H264 stream in {video_file}")
+        return None
+
+    try:
+        level = f"{int(params_video['level']) / 10:.1f}"
+    except (KeyError, TypeError, ValueError):
+        level = '4.1'
+
+    profile = str(params_video.get('profile', 'high')).lower().replace(' ', '')
+
+    return {
+        'width': int(params_video['width']),
+        'height': int(params_video['height']),
+        'fps': params_video.get('r_frame_rate', '15/1'),
+        'profile': profile,
+        'level': level,
+        'audio_rate': int(params_audio.get('sample_rate', 44100)) if params_audio else 44100,
+        'audio_channels': int(params_audio.get('channels', 2)) if params_audio else 2,
+    }
+
+
+def probe_duration_seconds(video_file: Union[str, Path]) -> Optional[float]:
+    """Container duration in seconds, or None if it cannot be read.
+
+    Catches some truncated files, but not all, and the difference is where the
+    MP4 keeps its moov atom. Measured on a clip cut to 40 KB of 8 MB:
+
+        moov at the end             -> no duration      (truncation detected)
+        moov at the front           -> duration 23.064  (not detected)
+
+    Blink's clips currently put moov at the front, so this does NOT reliably
+    detect a truncated Blink clip -- it is a cheap extra filter, not a
+    guarantee. A full decode is the only reliable test and is far too expensive
+    to run per call. Note that a truncated clip still reports correct stream
+    parameters, so it does not mis-describe the stream it seeds; it only plays
+    badly.
+    """
+    if not Path(video_file).exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'csv=p=0', str(video_file)],
+            capture_output=True, timeout=30,
+        )
+    except Exception as e:
+        log.debug(f"probe_duration_seconds: cannot probe {video_file}: {e}")
+        return None
+
+    try:
+        return float(result.stdout.decode(errors='replace').strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def is_usable_clip(video_file: Union[str, Path]) -> bool:
+    """Whether a video file is sound enough to seed or feed a stream.
+
+    Reliably rejects: missing, empty and unreadable files, and anything ffprobe
+    cannot get H264 stream parameters out of. Those matter because this file
+    seeds the stream, and the publisher derives its RTSP SDP from the first
+    thing it plays -- a bad seed mis-describes the stream for as long as the
+    publisher runs.
+
+    Does NOT reliably reject a truncated-but-parseable file; see
+    probe_duration_seconds() for why and for what that costs. That case is the
+    milder one anyway: such a file still carries the camera's real parameters,
+    so the SDP it produces is correct and only playback suffers.
+    """
+    return probe_stream_shape(video_file) is not None and bool(probe_duration_seconds(video_file))
+
+
+def sdp_fields(shape: Dict) -> tuple:
+    """The parts of a stream shape that a reader is told about in the RTSP SDP.
+
+    Resolution and H264 profile/level travel in sprop-parameter-sets and
+    profile-level-id, and the AAC layout in the audio fmtp. Frame rate is not
+    described there -- it is carried in the timestamps -- so two files that
+    differ only in frame rate describe the same stream.
+
+    That distinction is what this exists for. Blink clips genuinely vary in
+    frame rate between recordings (343/12 and 25/1 have both been observed on
+    one camera within an hour), so comparing whole shapes treats every such
+    clip as a new stream. Compare these fields instead wherever the question is
+    "does this still describe the same stream", and use the full shape only
+    where the value is actually needed, such as encoder flags.
+    """
+    return (
+        shape['width'], shape['height'],
+        shape['profile'], shape['level'],
+        shape['audio_rate'], shape['audio_channels'],
+    )
+
+
 def generate_placeholder_video(
     output_path: Union[str, Path],
     text: str,
@@ -51,12 +175,26 @@ def generate_placeholder_video(
     height: int = 1080,
     fps: int = 15,
     duration: float = 1.0,
+    profile: str = 'high',
+    level: str = '4.1',
+    audio_rate: int = 44100,
+    audio_channels: int = 2,
 ) -> bool:
     """Generate a short placeholder video with a solid background and centered text.
 
     Used to produce the Starting, Offline, and Error screen videos. All output
     videos are H264/AAC at the given resolution so they are codec-compatible
     with real Blink clips in the concat stream.
+
+    Codec-compatible is not enough on its own: the placeholder shares a concat
+    stream with the camera's real clips, and FFmpeg publishes that stream with
+    -c copy, so the RTSP SDP is written once from whatever plays first and is
+    never updated afterwards. Resolution, frame rate, H264 profile/level and
+    the audio layout all end up in that SDP, so a placeholder that differs in
+    any of them leaves the stream describing something other than what it
+    carries. Callers therefore pass the parameters of the camera the
+    placeholder belongs to; the defaults are only a fallback for a camera that
+    has not produced a clip yet.
 
     Args:
         output_path: Destination file path for the generated video.
@@ -67,6 +205,10 @@ def generate_placeholder_video(
         height: Frame height in pixels (default: 1080).
         fps: Frames per second (default: 15).
         duration: Duration of the video in seconds (default: 1.0).
+        profile: H264 profile to encode with (default: 'high').
+        level: H264 level, as FFmpeg spells it, e.g. '4.0' (default: '4.1').
+        audio_rate: Audio sample rate in Hz (default: 44100).
+        audio_channels: Audio channel count (default: 2).
 
     Returns:
         True if the video was created successfully, False otherwise.
@@ -92,13 +234,16 @@ def generate_placeholder_video(
         vf = None
         log.warning("generate_placeholder_video: no system font found, skipping text overlay")
 
+    channel_layout = 'mono' if int(audio_channels) == 1 else 'stereo'
+
     ffmpeg_cmd = [
         'ffmpeg', *COMMON_FFMPEG_ARGS,
         '-f', 'lavfi', '-i', f"color={bg_color}:size={width}x{height}:rate={fps}",
-        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-        '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1',
+        '-f', 'lavfi',
+        '-i', f"anullsrc=channel_layout={channel_layout}:sample_rate={audio_rate}",
+        '-c:v', 'libx264', '-profile:v', str(profile), '-level:v', str(level),
         '-pix_fmt', 'yuv420p', '-b:v', '500k',
-        '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '64k',
+        '-c:a', 'aac', '-ar', str(audio_rate), '-ac', str(audio_channels), '-b:a', '64k',
         '-t', str(duration),
         '-movflags', 'faststart',
     ]
@@ -373,7 +518,12 @@ class FrameToVideo:
                 raise ValueError(f"Missing required video parameters: {missing_params}")
             
             time_base_denominator = params_video['time_base'].split('/')[1]
-            fps_value = params_video['r_frame_rate']
+            # The still may be encoded at a lower frame rate than the clip it
+            # was cut from. Frame rate is not in the SDP and the concat stream
+            # already carries mixed rates from the clips themselves, so this
+            # changes nothing a reader is told -- it only decides how many
+            # frames have to be encoded for a still of a given length.
+            fps_value = str(CONFIG.get('still_video_fps') or params_video['r_frame_rate'])
         except (KeyError, IndexError, ValueError) as e:
             log.error(f"Invalid video parameters: {e}")
             raise ValueError(f"Invalid video parameters: {e}")

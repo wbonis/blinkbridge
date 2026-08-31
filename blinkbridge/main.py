@@ -17,6 +17,7 @@ from rich.logging import RichHandler
 
 from blinkbridge.blink import CameraManager
 from blinkbridge.config import *
+from blinkbridge.ffmpeg import probe_duration_seconds, probe_stream_shape
 from blinkbridge.stream_server import StreamServer
 from blinkbridge.web import BlinkBridgeWebServer
 
@@ -27,6 +28,10 @@ log = logging.getLogger(__name__)
 MIN_BLINK_THROTTLE = 2
 # How often to log summary status at INFO level (seconds)
 LOG_INTERVAL_SECONDS = 30
+# How long to leave a clip queued when its length could not be probed. Only a
+# fallback: without a length there is nothing to base the repeat count on, but
+# the still still has to come back eventually.
+STILL_SWAP_FALLBACK_SECONDS = 30
 # Grace period for FFmpeg processes to shutdown cleanly (seconds)
 SHUTDOWN_GRACE_PERIOD = 0.2
 
@@ -60,6 +65,10 @@ class Application:
         # Per-camera operational state and starting-poll counter
         self.camera_states: Dict[str, CameraState] = {}
         self.camera_starting_polls: Dict[str, int] = defaultdict(int)
+        # When each camera's still was last refreshed from a fresh snapshot
+        self.camera_last_snapshot: Dict[str, datetime] = {}
+        # Pending deferred still swaps, one task per camera
+        self.pending_still_swaps: Dict[str, asyncio.Task] = {}
 
     async def start_stream(self, camera_name: str, redownload: bool = False) -> Optional[StreamServer]:
         """Start a stream server for a camera using the Starting placeholder.
@@ -79,7 +88,20 @@ class Application:
             log.debug(f"{camera_name}: skipping stream start (shutdown in progress)")
             return None
 
-        starting_video = self.cam_manager.starting_placeholder_path
+        # Fetch a clip before opening the stream. FFmpeg publishes with -c copy,
+        # so it writes the RTSP SDP once from the very first file it plays and
+        # never revises it; whatever shape that file has is what readers are
+        # told the stream is, for as long as it runs. Having a clip on disk
+        # first lets get_placeholder() build a Starting screen at this camera's
+        # own resolution, frame rate and audio layout, so the announced stream
+        # still matches once the camera goes LIVE. The monitoring loop would
+        # fetch this clip a poll later anyway.
+        try:
+            await self.cam_manager.save_latest_clip(camera_name)
+        except Exception as e:
+            log.debug(f"{camera_name}: no clip available before stream start: {e}")
+
+        starting_video = self.cam_manager.get_placeholder('starting', camera_name)
         if starting_video is None:
             log.error(f"{camera_name}: starting placeholder not available, cannot start stream")
             return None
@@ -247,8 +269,13 @@ class Application:
         rtsp_host = str(export_cfg.get('rtsp_host', CONFIG['rtsp_server']['address']))
         rtsp_port = int(export_cfg.get('rtsp_port', CONFIG['rtsp_server']['port']))
         detect_defaults = dict(export_cfg.get('detect_defaults', {}))
-        width = int(detect_defaults.get('width', 1280))
-        height = int(detect_defaults.get('height', 720))
+        # No built-in fallback dimensions: an unset default means "let Frigate
+        # work it out", which is safer than a guess that happens to be wrong
+        # for this camera. See the per-camera loop below.
+        width = detect_defaults.get('width')
+        height = detect_defaults.get('height')
+        width = int(width) if width else None
+        height = int(height) if height else None
         fps = int(detect_defaults.get('fps', 1))
 
         lines = [
@@ -259,6 +286,24 @@ class Application:
 
         for camera_name in camera_names:
             camera_key = camera_name.replace(' ', '_').lower()
+
+            # Detect geometry: measured beats configured beats omitted. Blink
+            # models differ in resolution (720p through 1440p), so writing the
+            # configured detect_defaults for every camera would hand Frigate
+            # the wrong frame geometry for any camera that isn't that size --
+            # and silently mask the very mismatch this export exists to
+            # surface. Measure it from the camera's own most recent clip; fall
+            # back to the configured defaults only when there is no clip to
+            # measure; and when there is neither, write no dimensions at all so
+            # Frigate reads them off the stream itself rather than trusting a
+            # guess. detect fps stays configured: that's Frigate's analysis
+            # rate, not the stream's.
+            shape = probe_stream_shape(PATH_VIDEOS / f"{camera_key}_latest.mp4")
+            if shape is not None:
+                cam_width, cam_height = shape['width'], shape['height']
+            else:
+                cam_width, cam_height = width, height
+
             lines.append(f"  {camera_key}:")
             lines.append("    ffmpeg:")
             lines.append("      inputs:")
@@ -268,8 +313,11 @@ class Application:
                 lines.append(f"            - {role}")
             lines.append("    detect:")
             lines.append("      enabled: true")
-            lines.append(f"      width: {width}")
-            lines.append(f"      height: {height}")
+            if cam_width and cam_height:
+                lines.append(f"      width: {cam_width}")
+                lines.append(f"      height: {cam_height}")
+            else:
+                lines.append("      # width/height omitted -- Frigate reads them from the stream")
             lines.append(f"      fps: {fps}")
 
         output_path = Path(str(export_cfg.get('output_path', PATH_CONFIG / 'frigate_cameras.yml')))
@@ -443,10 +491,12 @@ class Application:
 
         # --- Step 3: state transitions ---
 
-        # Helper shorthands
-        offline_video  = self.cam_manager.offline_placeholder_path
-        starting_video = self.cam_manager.starting_placeholder_path
-        error_video    = self.cam_manager.error_placeholder_path
+        # Helper shorthands. Resolved per camera so the placeholder matches
+        # this camera's stream shape and swapping to it needs no publisher
+        # restart (see CameraManager.get_placeholder).
+        offline_video  = self.cam_manager.get_placeholder('offline', camera_name)
+        starting_video = self.cam_manager.get_placeholder('starting', camera_name)
+        error_video    = self.cam_manager.get_placeholder('error', camera_name)
 
         if is_offline:
             if current_state != CameraState.OFFLINE:
@@ -462,7 +512,7 @@ class Application:
         if new_clip:
             if current_state != CameraState.LIVE:
                 log.info(f"{camera_name}: clip received — going LIVE (was {current_state.value})")
-            ss.add_video(new_clip)
+            self._add_clip_with_repeats(camera_name, ss, new_clip)
             self.camera_states[camera_name] = CameraState.LIVE
             self.camera_starting_polls[camera_name] = 0
             return
@@ -470,7 +520,10 @@ class Application:
         # Online, no new motion clip.
 
         if current_state == CameraState.LIVE:
-            # Still online and streaming — nothing to do.
+            # Still online and streaming. The looping still is the last frame of
+            # the last clip, so without this it keeps showing whatever was in
+            # frame when that clip ended until the next motion event.
+            await self._refresh_still_if_due(camera_name, ss)
             return
 
         if current_state == CameraState.OFFLINE:
@@ -488,7 +541,7 @@ class Application:
                 clip = await self.cam_manager.save_latest_clip(camera_name)
                 if clip is not None:
                     log.info(f"{camera_name}: found historical clip — going LIVE")
-                    ss.add_video(clip)
+                    self._add_clip_with_repeats(camera_name, ss, clip)
                     self.camera_states[camera_name] = CameraState.LIVE
                     self.camera_starting_polls[camera_name] = 0
                     return
@@ -514,13 +567,150 @@ class Application:
                 clip = await self.cam_manager.save_latest_clip(camera_name)
                 if clip is not None:
                     log.info(f"{camera_name}: recovered from ERROR — going LIVE")
-                    ss.add_video(clip)
+                    self._add_clip_with_repeats(camera_name, ss, clip)
                     self.camera_states[camera_name] = CameraState.LIVE
                     self.camera_starting_polls[camera_name] = 0
             except Exception as e:
                 log.warning(f"{camera_name}: error during ERROR recovery check: {e}")
             return
     
+    def _add_clip_with_repeats(self, camera_name: str, ss: StreamServer, clip: Path) -> None:
+        """Queue a motion clip and let it repeat before the still takes over.
+
+        The stream is a concat loop, so a clip repeats for as long as it stays
+        queued. Historically the still replaced it about a second later, which
+        meant the clip played exactly once -- one pass of roughly 15 seconds,
+        and at the frame rate a detector downstream actually receives, too few
+        frames to recognise anything. Measured here: Frigate produced no event
+        from a 15 s clip played once, and produced one from the same clip left
+        looping.
+
+        So the still is deferred and swapped in by a background task after the
+        clip has had its repeats. The wait must not block the caller: this runs
+        inside the monitoring loop, and sleeping here would stall motion polling
+        and the stream watchdog for the whole duration.
+        """
+        # The still now comes from this clip's last frame, so it is as fresh as
+        # a snapshot would make it. Restart the refresh timer here rather than at
+        # one call site: a clip also arrives through the STARTING and ERROR
+        # recovery paths, and those left the timer running, so a refresh could
+        # fall due seconds after startup and cut the clip short.
+        self.camera_last_snapshot[camera_name] = datetime.now()
+
+        repeats = CONFIG.get('clip_repeats', 3)
+        try:
+            repeats = max(1, int(repeats))
+        except (TypeError, ValueError):
+            log.warning(f"{camera_name}: invalid clip_repeats {repeats!r}, using 1")
+            repeats = 1
+
+        # The still is ALWAYS deferred, never written by add_video itself. If it
+        # were, the wait for the publisher expiring would make _enqueue_clip()
+        # overwrite a clip the publisher has not opened yet -- the clip would
+        # never play at all, and nothing would say so. The comment on that path
+        # reads "video might still work", which is exactly what does not happen.
+        # Deferring means a clip that has not been reached yet stays queued and
+        # plays when the publisher gets to it.
+        duration = probe_duration_seconds(clip)
+        if duration:
+            delay = repeats * duration
+        else:
+            delay = STILL_SWAP_FALLBACK_SECONDS
+            log.debug(
+                f"{camera_name}: clip length unknown, showing the still again "
+                f"in {delay}s"
+            )
+
+        ss.add_video(clip, defer_still=True)
+
+        # Cancel any swap still pending from a previous clip: that still has
+        # been replaced and swapping it in now would show stale footage.
+        self._cancel_still_swap(camera_name)
+        self.pending_still_swaps[camera_name] = asyncio.create_task(
+            self._swap_in_still_after(camera_name, ss, delay)
+        )
+        log.debug(
+            f"{camera_name}: clip queued, still follows in {delay:.1f}s"
+        )
+
+    async def _swap_in_still_after(self, camera_name: str, ss: StreamServer, delay: float) -> None:
+        """Put the still back on the stream after a deferred clip has repeated."""
+        try:
+            await asyncio.sleep(delay)
+            ss.swap_in_still()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"{camera_name}: failed to swap the still back in: {e}")
+        finally:
+            self.pending_still_swaps.pop(camera_name, None)
+
+    def _cancel_still_swap(self, camera_name: str) -> None:
+        """Drop a pending still swap for one camera, if any."""
+        task = self.pending_still_swaps.pop(camera_name, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _snapshot_interval_minutes(self, camera_name: str) -> int:
+        """Minutes between snapshot-driven still refreshes for one camera.
+
+        Per-camera because the trade-off differs per model: a mains-powered
+        camera can refresh often, a battery-powered one pays for every wake-up.
+        0 (the default) disables the refresh for that camera.
+        """
+        cfg = CONFIG.get('snapshot_refresh', {})
+        if not cfg.get('enabled', True):
+            return 0
+
+        per_camera = cfg.get('per_camera', {})
+        value = per_camera.get(camera_name, cfg.get('default_interval_minutes', 0))
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            log.warning(f"{camera_name}: invalid snapshot interval {value!r}, disabling refresh")
+            return 0
+
+    async def _refresh_still_if_due(self, camera_name: str, ss: StreamServer) -> None:
+        """Refresh this camera's looping still from a new snapshot, if it is due.
+
+        Only called for a LIVE camera: in the other states the stream shows a
+        placeholder screen that must not be overwritten by camera footage.
+        """
+        interval = self._snapshot_interval_minutes(camera_name)
+        if interval <= 0:
+            return
+
+        # A clip is on the stream and still has repeats to go. Refreshing now
+        # would replace live footage with a static snapshot mid-event, which is
+        # the opposite of what either feature is for.
+        if camera_name in self.pending_still_swaps:
+            log.debug(f"{camera_name}: clip still playing, deferring snapshot refresh")
+            return
+
+        now = datetime.now()
+        last = self.camera_last_snapshot.get(camera_name)
+        if last is not None and now - last < timedelta(minutes=interval):
+            return
+
+        # Record the attempt before making it. A camera that fails to deliver a
+        # snapshot must not be retried on the next poll a few seconds later --
+        # every attempt wakes it, and that is the expensive part.
+        self.camera_last_snapshot[camera_name] = now
+
+        try:
+            image = await self.cam_manager.snap_and_fetch_thumbnail(camera_name)
+        except Exception as e:
+            log.warning(f"{camera_name}: snapshot refresh failed: {e}")
+            return
+
+        if image is None:
+            return
+
+        camera_name_sanitized = camera_name.replace(' ', '_').lower()
+        shape_source = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
+        if ss.refresh_still_from_image(image, shape_source):
+            log.info(f"{camera_name}: still refreshed from a new snapshot")
+
     async def _restart_failed_streams(self) -> None:
         """Restart any failed stream servers.
         
@@ -534,14 +724,34 @@ class Application:
             
             try:
                 ss = self.stream_servers[camera_name]
-                if ss.is_running():
+
+                # Two ways a stream can be dead. The process can be gone, which
+                # poll() sees; or the process can still be running while its
+                # connection to the RTSP server is half-closed, which it cannot.
+                # Only the second one is silent, so it is the one that costs
+                # hours -- see StreamServer.is_publisher_connected().
+                process_alive = ss.is_running()
+                connected = ss.is_publisher_connected() if process_alive else None
+
+                if process_alive and connected is not False:
                     ss.failure_detected = False
                     continue
 
                 # Log once when the failure is first detected.
                 if not ss.failure_detected:
                     ss.failure_detected = True
-                    log.warning(f"{camera_name}: stream stopped (failure count: {ss.failure_count + 1})")
+                    reason = "stream stopped" if not process_alive else (
+                        "publisher still running but its connection is closed"
+                    )
+                    log.warning(f"{camera_name}: {reason} (failure count: {ss.failure_count + 1})")
+
+                # A half-closed publisher is still holding the process and the
+                # path name; the replacement cannot take over until it is gone.
+                if process_alive:
+                    try:
+                        ss.close()
+                    except Exception as e:
+                        log.warning(f"{camera_name}: error stopping disconnected publisher: {e}")
 
                 if ss.failure_count >= CONFIG['cameras']['max_failures'] - 1:
                     log.warning(f"{camera_name}: max failures ({CONFIG['cameras']['max_failures']}) reached, disabling")
@@ -579,6 +789,9 @@ class Application:
         log.info("Closing application and stopping all streams...")
         log.info("Note: FFmpeg 'Broken pipe' errors during shutdown are normal")
         self.running = False
+
+        for camera_name in list(self.pending_still_swaps):
+            self._cancel_still_swap(camera_name)
 
         for camera_name, ss in list(self.stream_servers.items()):
             try:
@@ -633,6 +846,8 @@ class Application:
                 pass
             self._monitor_task = None
         # Stop all streams
+        for camera_name in list(self.pending_still_swaps):
+            self._cancel_still_swap(camera_name)
         for camera_name, ss in list(self.stream_servers.items()):
             try:
                 ss.close()

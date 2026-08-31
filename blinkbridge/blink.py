@@ -6,6 +6,7 @@ downloading video clips, and monitoring for motion detection events.
 import asyncio
 import json
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,7 +19,18 @@ from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
 
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import generate_placeholder_video
+from blinkbridge.ffmpeg import (
+    generate_placeholder_video,
+    is_usable_clip,
+    probe_stream_shape,
+    sdp_fields,
+)
+
+
+# How long to wait for a camera to upload a freshly taken snapshot before
+# giving up: attempts x delay. Blink cameras typically need a few seconds.
+SNAPSHOT_POLL_ATTEMPTS = 6
+SNAPSHOT_POLL_DELAY_SECONDS = 2.0
 
 
 log = logging.getLogger(__name__)
@@ -115,6 +127,10 @@ class CameraManager:
         self.starting_placeholder_path: Optional[Path] = None
         self.offline_placeholder_path: Optional[Path] = None
         self.error_placeholder_path: Optional[Path] = None
+        # Per-camera placeholder sets, plus the stream shape each was built for
+        # so they can be rebuilt if a camera's clips ever change shape.
+        self.camera_placeholders: Dict[str, Dict[str, Path]] = {}
+        self.camera_placeholder_shapes: Dict[str, Dict] = {}
         self.twofa_provider: Optional[Callable[[], Awaitable[str]]] = None
         self.credentials_provider: Optional[Callable[[], Awaitable[dict]]] = None
 
@@ -338,25 +354,95 @@ class CameraManager:
 
         return False
 
+    # (filename stem, on-screen text, background colour, text colour)
+    PLACEHOLDER_SPECS = {
+        'starting': ('starting_placeholder', 'Starting...', 'gray',  'white'),
+        'offline':  ('offline_placeholder',  'OFFLINE',     'black', 'red'),
+        'error':    ('error_placeholder',    'ERROR',       'black', 'red'),
+    }
+
+    async def snap_and_fetch_thumbnail(self, camera_name: str) -> Optional[Path]:
+        """Take a fresh photo on the camera and save it as a JPEG.
+
+        Blink only refreshes a camera's thumbnail on its own events, so the
+        cached one can be hours old -- measured at 123 minutes on both cameras
+        of the instance this was written for, which is why simply re-fetching
+        the existing thumbnail does not help. Only snap_picture() produces a
+        current image, and it wakes the camera to do so. That costs battery on
+        the battery-powered models, so callers must rate-limit; see
+        Application._refresh_still_if_due().
+
+        Returns:
+            Path to the saved JPEG, or None if the camera is unknown, the
+            snapshot did not arrive in time, or the file could not be written.
+        """
+        camera = self.blink.cameras.get(camera_name) if self.blink.cameras else None
+        if camera is None:
+            log.debug(f"{camera_name}: not in Blink\'s camera list, cannot take a snapshot")
+            return None
+
+        thumbnail_before = camera.thumbnail
+
+        try:
+            await camera.snap_picture()
+        except Exception as e:
+            log.warning(f"{camera_name}: snap_picture failed: {e}")
+            return None
+
+        # The camera uploads asynchronously, so the thumbnail URL only changes a
+        # few seconds later. Poll for a different URL rather than saving the old
+        # image again and believing it is new.
+        for _ in range(SNAPSHOT_POLL_ATTEMPTS):
+            await asyncio.sleep(SNAPSHOT_POLL_DELAY_SECONDS)
+            try:
+                await self.blink.refresh(force=True)
+            except Exception as e:
+                log.debug(f"{camera_name}: refresh while waiting for snapshot failed: {e}")
+                continue
+            if camera.thumbnail and camera.thumbnail != thumbnail_before:
+                break
+        else:
+            log.debug(
+                f"{camera_name}: thumbnail unchanged {SNAPSHOT_POLL_ATTEMPTS * SNAPSHOT_POLL_DELAY_SECONDS:.0f}s "
+                f"after snap_picture, leaving the current still in place"
+            )
+            return None
+
+        camera_name_sanitized = camera_name.replace(' ', '_').lower()
+        snapshot_path = PATH_VIDEOS / f"{camera_name_sanitized}_snapshot.jpg"
+        try:
+            await camera.image_to_file(str(snapshot_path))
+        except Exception as e:
+            log.warning(f"{camera_name}: could not save snapshot image: {e}")
+            return None
+
+        try:
+            if not snapshot_path.exists() or snapshot_path.stat().st_size == 0:
+                log.warning(f"{camera_name}: snapshot image is missing or empty")
+                return None
+        except OSError as e:
+            log.warning(f"{camera_name}: could not check snapshot image: {e}")
+            return None
+
+        return snapshot_path
+
     def _generate_placeholders(self) -> None:
-        """Generate the three placeholder videos used for camera state display.
+        """Generate the shared fallback placeholder videos.
 
         Creates:
         - starting_placeholder.mp4 : grey screen with white "Starting..." text
         - offline_placeholder.mp4  : black screen with red "OFFLINE" text
         - error_placeholder.mp4    : black screen with red "ERROR" text
 
-        All videos are 1920x1080 H264 at 15 fps to be codec-compatible with
-        real Blink clips in the concat stream.
+        These are 1920x1080 H264 at 15 fps and are only used for a camera that
+        has not produced a clip yet, since there is nothing to match against at
+        that point. Once a clip exists, get_placeholder() serves a per-camera
+        set built to that camera's stream shape instead.
         """
         duration = CONFIG['still_video_duration']
-        specs = [
-            ('starting_placeholder.mp4', 'Starting...', 'gray',  'white', 'starting_placeholder_path'),
-            ('offline_placeholder.mp4',  'OFFLINE',     'black',  'red',  'offline_placeholder_path'),
-            ('error_placeholder.mp4',    'ERROR',       'black',  'red',  'error_placeholder_path'),
-        ]
-        for filename, text, bg, fg, attr in specs:
-            path = PATH_VIDEOS / filename
+        for state, (stem, text, bg, fg) in self.PLACEHOLDER_SPECS.items():
+            path = PATH_VIDEOS / f"{stem}.mp4"
+            attr = f"{state}_placeholder_path"
             if path.exists():
                 log.debug(f"Placeholder already exists: {path}")
                 setattr(self, attr, path)
@@ -374,7 +460,98 @@ class CameraManager:
             if ok:
                 setattr(self, attr, path)
             else:
-                log.error(f"Failed to generate placeholder video: {filename}")
+                log.error(f"Failed to generate placeholder video: {path.name}")
+
+    def get_placeholder(self, state: str, camera_name: str) -> Optional[Path]:
+        """Return the placeholder video for a camera state, matched to that camera.
+
+        Placeholders share a concat stream with the camera's real clips, and
+        FFmpeg publishes that stream with -c copy, so the RTSP SDP is written
+        once from whatever plays first and never updated. A placeholder whose
+        resolution, frame rate, H264 profile/level or audio layout differs from
+        the camera's clips therefore leaves the published stream describing
+        something other than what it carries, which breaks readers such as
+        Frigate. So each camera gets its own placeholder set, built from the
+        shape of its most recent clip.
+
+        Before a camera has downloaded a clip there is nothing to match, so the
+        shared 1920x1080 fallback is returned; StreamServer restarts the
+        publisher when the first real clip changes the stream shape, which
+        re-writes the SDP.
+
+        Args:
+            state: One of 'starting', 'offline', 'error'.
+            camera_name: Camera the placeholder is for.
+
+        Returns:
+            Path to a placeholder video, or None if none could be produced.
+        """
+        fallback = getattr(self, f"{state}_placeholder_path", None)
+        if state not in self.PLACEHOLDER_SPECS:
+            log.warning(f"{camera_name}: unknown placeholder state '{state}'")
+            return fallback
+
+        camera_name_sanitized = camera_name.replace(' ', '_').lower()
+        reference = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
+        if not reference.exists():
+            return fallback
+
+        shape = probe_stream_shape(reference)
+        if shape is None:
+            return fallback
+
+        # Compared on SDP fields, not the whole shape. Blink's clips vary in
+        # frame rate between recordings, and rebuilding on that would re-encode
+        # three placeholders at full camera resolution every time a clip with a
+        # slightly different rate arrives -- which is exactly when a motion clip
+        # is being spliced and the publisher needs the CPU. Frame rate is not in
+        # the SDP and the concat stream already carries mixed rates from the
+        # clips themselves, so matching it buys nothing.
+        known = self.camera_placeholder_shapes.get(camera_name)
+        if known is None or sdp_fields(known) != sdp_fields(shape):
+            self._generate_camera_placeholders(camera_name, camera_name_sanitized, shape)
+
+        return self.camera_placeholders.get(camera_name, {}).get(state, fallback)
+
+    def _generate_camera_placeholders(
+        self, camera_name: str, camera_name_sanitized: str, shape: Dict
+    ) -> None:
+        """Build this camera's placeholder set for the given stream shape.
+
+        Called only when the shape differs from the set already on disk, so a
+        camera that keeps producing clips of the same shape encodes its
+        placeholders once.
+        """
+        duration = CONFIG['still_video_duration']
+        generated: Dict[str, Path] = {}
+
+        for state, (stem, text, bg, fg) in self.PLACEHOLDER_SPECS.items():
+            path = PATH_VIDEOS / f"{camera_name_sanitized}_{stem}.mp4"
+            ok = generate_placeholder_video(
+                output_path=path,
+                text=text,
+                bg_color=bg,
+                text_color=fg,
+                duration=duration,
+                **shape,
+            )
+            if ok:
+                generated[state] = path
+            else:
+                log.error(f"{camera_name}: failed to generate {state} placeholder")
+
+        if len(generated) == len(self.PLACEHOLDER_SPECS):
+            self.camera_placeholders[camera_name] = generated
+            self.camera_placeholder_shapes[camera_name] = shape
+            log.info(
+                f"{camera_name}: placeholders rebuilt for {shape['width']}x{shape['height']} "
+                f"@ {shape['fps']}, audio {shape['audio_rate']}Hz/{shape['audio_channels']}ch"
+            )
+        else:
+            # Partial sets would reintroduce the mismatch on whichever state
+            # failed, so discard and keep using the shared fallback.
+            self.camera_placeholders.pop(camera_name, None)
+            self.camera_placeholder_shapes.pop(camera_name, None)
 
     def _detect_resolution_from_clips(self) -> Tuple[int, int]:
         """Detect resolution from clips. Returns default Blink resolution (1920x1080).
@@ -534,8 +711,25 @@ class CameraManager:
     
         try:
             if file_name.exists() and not force:
-                log.debug(f"{camera_name}: skipping download, {file_name} exists")
-                return file_name
+                # Validate before reusing. The download path below checks what
+                # it writes, but this path hands back whatever is on disk, and
+                # PATH_VIDEOS can outlive the container -- a file truncated by a
+                # kill mid-download would otherwise be reused indefinitely. This
+                # clip also seeds the stream, and the publisher derives its RTSP
+                # SDP from the first thing it plays, so a bad file here is not a
+                # local failure: it mis-describes the stream for as long as the
+                # publisher runs.
+                if is_usable_clip(file_name):
+                    log.debug(f"{camera_name}: skipping download, {file_name} exists")
+                    return file_name
+                log.warning(
+                    f"{camera_name}: cached clip {file_name.name} is unreadable, "
+                    f"discarding it and downloading again"
+                )
+                try:
+                    file_name.unlink()
+                except OSError as e:
+                    log.warning(f"{camera_name}: could not delete unreadable cached clip: {e}")
         except OSError as e:
             log.warning(f"{camera_name}: error checking if file exists: {e}")
 
@@ -564,13 +758,23 @@ class CameraManager:
                 log.error(f"{camera_name}: received empty video data")
                 raise ValueError("Empty video data")
                 
-            with open(file_name, 'wb') as f:
-                f.write(video_data)
-            
-            # Verify file was written
-            if not file_name.exists() or file_name.stat().st_size == 0:
-                log.error(f"{camera_name}: video file not created or is empty")
-                raise IOError("Failed to write video file")
+            # Written beside the target and renamed into place, like
+            # _save_clip(): the publisher may hold the existing file open.
+            tmp_name = file_name.with_suffix(file_name.suffix + '.part')
+            try:
+                with open(tmp_name, 'wb') as f:
+                    f.write(video_data)
+
+                if not tmp_name.exists() or tmp_name.stat().st_size == 0:
+                    raise IOError("Failed to write video file")
+
+                os.replace(tmp_name, file_name)
+            except BaseException:
+                try:
+                    tmp_name.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
             
             log.debug(f"{camera_name}: successfully downloaded real clip ({file_name.stat().st_size} bytes)")
             return file_name
@@ -613,12 +817,32 @@ class CameraManager:
             if not video_data:
                 raise ValueError("Empty video data received")
                 
-            with open(file_name, 'wb') as f:
-                f.write(video_data)
-                
-            # Verify file was written
-            if not file_name.exists() or file_name.stat().st_size == 0:
-                raise IOError("Failed to write video file or file is empty")
+            # Write beside the target and rename into place rather than
+            # writing over it. The publisher may be reading this very file: a
+            # clip stays queued for several plays now, so a second motion event
+            # arriving during that window used to truncate the file mid-read.
+            # FFmpeg reported "Invalid NAL unit size", then "moov atom not
+            # found", then "Impossible to open" and the publisher died.
+            #
+            # rename() is atomic and does not disturb an already-open
+            # descriptor: the running FFmpeg keeps reading the old inode to the
+            # end of its pass, and only the next open sees the new clip. Both
+            # are complete files, so either is safe to play.
+            tmp_name = file_name.with_suffix(file_name.suffix + '.part')
+            try:
+                with open(tmp_name, 'wb') as f:
+                    f.write(video_data)
+
+                if not tmp_name.exists() or tmp_name.stat().st_size == 0:
+                    raise IOError("Failed to write video file or file is empty")
+
+                os.replace(tmp_name, file_name)
+            except BaseException:
+                try:
+                    tmp_name.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
                 
             log.debug(f'{camera_name}: video saved ({file_name.stat().st_size} bytes)')
         except IOError as e:
@@ -704,16 +928,27 @@ class CameraManager:
             log.error(f"{camera_name}: error processing snapshot: {e}")
             return None
         
-        # Download regular video clip
+        # Download regular video clip. Downloaded beside the target and renamed
+        # into place for the same reason as _save_clip(): with clip_repeats the
+        # publisher can still be reading this very file when the next motion
+        # event arrives, and writing over it truncates it mid-read.
         try:
             log.debug(f"{camera_name}: downloading clip to {file_name}")
-            await camera.video_to_file(file_name)
-            
-            # Verify file was created
-            if not file_name.exists() or file_name.stat().st_size == 0:
-                log.error(f"{camera_name}: video file not created or is empty")
-                return None
-                
+            tmp_name = file_name.with_suffix(file_name.suffix + '.part')
+            try:
+                await camera.video_to_file(tmp_name)
+
+                if not tmp_name.exists() or tmp_name.stat().st_size == 0:
+                    raise IOError("video file not created or is empty")
+
+                os.replace(tmp_name, file_name)
+            except BaseException:
+                try:
+                    tmp_name.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
             self.camera_last_record[camera_name] = last_record
             log.debug(f"{camera_name}: clip saved to {file_name} ({file_name.stat().st_size} bytes)")
             return file_name
