@@ -18,7 +18,7 @@ from blinkbridge.ffmpeg import (
     probe_stream_shape,
     sdp_fields,
 )
-from blinkbridge.utils import wait_until_file_open
+from blinkbridge.utils import get_socket_states, wait_until_file_open
 
 
 log = logging.getLogger(__name__)
@@ -424,6 +424,62 @@ class StreamServer:
             self._enqueue_clip(placeholder_video)
         except Exception as e:
             log.error(f"{self.stream_name}: failed to swap to placeholder: {e}")
+
+    # /proc/net/tcp state codes. Only the terminal ones justify a restart:
+    # a socket still negotiating is not a failure, it is a publisher that has
+    # not finished connecting.
+    TCP_ESTABLISHED = '01'
+    TCP_CONNECTING = frozenset({'02', '03'})            # SYN_SENT, SYN_RECV
+    TCP_DEAD = frozenset({'04', '05', '06', '07', '08', '09', '0B'})
+
+    def is_publisher_connected(self) -> Optional[bool]:
+        """Whether the publisher still holds a live connection to the RTSP server.
+
+        is_running() only asks whether the process exists, and FFmpeg outlives
+        its connection: when the RTSP server drops the publisher, the socket
+        sits in CLOSE_WAIT and the process keeps running with nothing to write
+        to. The path disappears while every check the watchdog performs says
+        the stream is healthy.
+
+        That is not hypothetical. On this deployment a stream published to a
+        file that had been deleted underneath it, FFmpeg failed demuxing,
+        MediaMTX dropped the publisher, and the camera stayed dark for ten
+        minutes without a single warning being logged -- because poll() kept
+        returning None the whole time.
+
+        Returns:
+            True if at least one socket is ESTABLISHED, False if the process
+            holds sockets and none of them is, and None when there is nothing
+            to conclude from -- no sockets yet, or /proc unreadable. None must
+            not be treated as a failure: a publisher that has only just started
+            has no socket either.
+        """
+        if self.process is None:
+            return None
+
+        try:
+            states = get_socket_states(self.process.pid)
+        except Exception as e:
+            log.debug(f"{self.stream_name}: could not read socket states: {e}")
+            return None
+
+        if not states:
+            return None
+
+        if self.TCP_ESTABLISHED in states:
+            return True
+
+        if any(s in self.TCP_CONNECTING for s in states):
+            # Mid-handshake. Saying "dead" here would restart a publisher that
+            # is merely still coming up.
+            return None
+
+        if all(s in self.TCP_DEAD for s in states):
+            return False
+
+        # Some other state (LISTEN, or something unrecognised). Not a
+        # publisher socket we can reason about, so do not act on it.
+        return None
 
     def is_running(self) -> bool:
         """Check if the streaming process is still running.

@@ -638,14 +638,34 @@ class Application:
             
             try:
                 ss = self.stream_servers[camera_name]
-                if ss.is_running():
+
+                # Two ways a stream can be dead. The process can be gone, which
+                # poll() sees; or the process can still be running while its
+                # connection to the RTSP server is half-closed, which it cannot.
+                # Only the second one is silent, so it is the one that costs
+                # hours -- see StreamServer.is_publisher_connected().
+                process_alive = ss.is_running()
+                connected = ss.is_publisher_connected() if process_alive else None
+
+                if process_alive and connected is not False:
                     ss.failure_detected = False
                     continue
 
                 # Log once when the failure is first detected.
                 if not ss.failure_detected:
                     ss.failure_detected = True
-                    log.warning(f"{camera_name}: stream stopped (failure count: {ss.failure_count + 1})")
+                    reason = "stream stopped" if not process_alive else (
+                        "publisher still running but its connection is closed"
+                    )
+                    log.warning(f"{camera_name}: {reason} (failure count: {ss.failure_count + 1})")
+
+                # A half-closed publisher is still holding the process and the
+                # path name; the replacement cannot take over until it is gone.
+                if process_alive:
+                    try:
+                        ss.close()
+                    except Exception as e:
+                        log.warning(f"{camera_name}: error stopping disconnected publisher: {e}")
 
                 if ss.failure_count >= CONFIG['cameras']['max_failures'] - 1:
                     log.warning(f"{camera_name}: max failures ({CONFIG['cameras']['max_failures']}) reached, disabling")
