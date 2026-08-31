@@ -81,6 +81,14 @@ class StreamServer:
             '-i', str(input_concat_file.resolve()),
             '-flush_packets', '0',
             '-c:v', 'copy', '-c:a', 'copy',
+            # FFmpeg's RTSP muxer defaults to 1472-byte packets, above
+            # MediaMTX's 1440 limit, so it logs "RTP packets are too big
+            # (1460 > 1440), remuxing them into smaller ones" on every path and
+            # then repacks every oversized packet for the life of the stream.
+            # That cost is paid by the same component that discards frames when
+            # a reader falls behind, and it is avoidable by not producing
+            # oversized packets in the first place.
+            '-pkt_size', '1200',
             '-f', 'rtsp',
             '-fps_mode', 'drop',
             output_url
