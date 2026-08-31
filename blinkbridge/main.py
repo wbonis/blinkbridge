@@ -626,7 +626,6 @@ class Application:
         # Cancel any swap still pending from a previous clip: that still has
         # been replaced and swapping it in now would show stale footage.
         self._cancel_still_swap(camera_name)
-        delay = repeats * duration
         self.pending_still_swaps[camera_name] = asyncio.create_task(
             self._swap_in_still_after(camera_name, ss, delay)
         )
