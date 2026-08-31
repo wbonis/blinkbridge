@@ -758,13 +758,23 @@ class CameraManager:
                 log.error(f"{camera_name}: received empty video data")
                 raise ValueError("Empty video data")
                 
-            with open(file_name, 'wb') as f:
-                f.write(video_data)
-            
-            # Verify file was written
-            if not file_name.exists() or file_name.stat().st_size == 0:
-                log.error(f"{camera_name}: video file not created or is empty")
-                raise IOError("Failed to write video file")
+            # Written beside the target and renamed into place, like
+            # _save_clip(): the publisher may hold the existing file open.
+            tmp_name = file_name.with_suffix(file_name.suffix + '.part')
+            try:
+                with open(tmp_name, 'wb') as f:
+                    f.write(video_data)
+
+                if not tmp_name.exists() or tmp_name.stat().st_size == 0:
+                    raise IOError("Failed to write video file")
+
+                os.replace(tmp_name, file_name)
+            except BaseException:
+                try:
+                    tmp_name.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
             
             log.debug(f"{camera_name}: successfully downloaded real clip ({file_name.stat().st_size} bytes)")
             return file_name
@@ -918,16 +928,27 @@ class CameraManager:
             log.error(f"{camera_name}: error processing snapshot: {e}")
             return None
         
-        # Download regular video clip
+        # Download regular video clip. Downloaded beside the target and renamed
+        # into place for the same reason as _save_clip(): with clip_repeats the
+        # publisher can still be reading this very file when the next motion
+        # event arrives, and writing over it truncates it mid-read.
         try:
             log.debug(f"{camera_name}: downloading clip to {file_name}")
-            await camera.video_to_file(file_name)
-            
-            # Verify file was created
-            if not file_name.exists() or file_name.stat().st_size == 0:
-                log.error(f"{camera_name}: video file not created or is empty")
-                return None
-                
+            tmp_name = file_name.with_suffix(file_name.suffix + '.part')
+            try:
+                await camera.video_to_file(tmp_name)
+
+                if not tmp_name.exists() or tmp_name.stat().st_size == 0:
+                    raise IOError("video file not created or is empty")
+
+                os.replace(tmp_name, file_name)
+            except BaseException:
+                try:
+                    tmp_name.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
             self.camera_last_record[camera_name] = last_record
             log.debug(f"{camera_name}: clip saved to {file_name} ({file_name.stat().st_size} bytes)")
             return file_name
