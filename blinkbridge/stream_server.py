@@ -90,6 +90,11 @@ class StreamServer:
             # oversized packets in the first place.
             '-pkt_size', '1200',
             '-f', 'rtsp',
+            # MediaMTX only accepts TCP here (MTX_RTSPTRANSPORTS=tcp in
+            # compose.yaml). Without this FFmpeg negotiates UDP first and logs
+            # "method SETUP failed: 461 (Unsupported Transport)" on every
+            # publisher start before falling back.
+            '-rtsp_transport', 'tcp',
             '-fps_mode', 'drop',
             output_url
         ]
