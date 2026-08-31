@@ -208,7 +208,8 @@ class StreamServer:
             self.published_shape = shape
             return
 
-        if shape == self.published_shape:
+        if self._sdp_fields(shape) == self._sdp_fields(self.published_shape):
+            self.published_shape = shape
             return
 
         log.warning(
@@ -218,6 +219,30 @@ class StreamServer:
             f"restart this stream to republish it"
         )
         self.published_shape = shape
+
+    @staticmethod
+    def _sdp_fields(shape: Dict) -> tuple:
+        """The parts of a stream shape that actually reach the RTSP SDP.
+
+        Resolution, H264 profile and level travel in sprop-parameter-sets and
+        profile-level-id, and the AAC layout in the audio fmtp, so a reader
+        that decodes against a stale SDP gets those wrong. Frame rate is not
+        described there at all -- it is carried in the timestamps -- so a
+        difference in it cannot mis-describe the stream.
+
+        Excluding it is not just tidiness: ffprobe reports r_frame_rate as a
+        derived ratio, and a still built from a clip comes back as 200/7 where
+        the clip itself reads 343/12. Those are 28.571 and 28.583 fps, the same
+        rate rounded differently, and comparing the raw strings reported that
+        as a shape change on every camera. A warning that fires when nothing is
+        wrong is worse than no warning, because it trains you to skip the one
+        that matters.
+        """
+        return (
+            shape['width'], shape['height'],
+            shape['profile'], shape['level'],
+            shape['audio_rate'], shape['audio_channels'],
+        )
 
     @staticmethod
     def _describe_shape(shape: Dict) -> str:
