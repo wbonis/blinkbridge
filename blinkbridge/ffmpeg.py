@@ -92,6 +92,58 @@ def probe_stream_shape(video_file: Union[str, Path]) -> Optional[Dict]:
     }
 
 
+def probe_duration_seconds(video_file: Union[str, Path]) -> Optional[float]:
+    """Container duration in seconds, or None if it cannot be read.
+
+    Catches some truncated files, but not all, and the difference is where the
+    MP4 keeps its moov atom. Measured on a clip cut to 40 KB of 8 MB:
+
+        moov at the end             -> no duration      (truncation detected)
+        moov at the front           -> duration 23.064  (not detected)
+
+    Blink's clips currently put moov at the front, so this does NOT reliably
+    detect a truncated Blink clip -- it is a cheap extra filter, not a
+    guarantee. A full decode is the only reliable test and is far too expensive
+    to run per call. Note that a truncated clip still reports correct stream
+    parameters, so it does not mis-describe the stream it seeds; it only plays
+    badly.
+    """
+    if not Path(video_file).exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'csv=p=0', str(video_file)],
+            capture_output=True, timeout=30,
+        )
+    except Exception as e:
+        log.debug(f"probe_duration_seconds: cannot probe {video_file}: {e}")
+        return None
+
+    try:
+        return float(result.stdout.decode(errors='replace').strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def is_usable_clip(video_file: Union[str, Path]) -> bool:
+    """Whether a video file is sound enough to seed or feed a stream.
+
+    Reliably rejects: missing, empty and unreadable files, and anything ffprobe
+    cannot get H264 stream parameters out of. Those matter because this file
+    seeds the stream, and the publisher derives its RTSP SDP from the first
+    thing it plays -- a bad seed mis-describes the stream for as long as the
+    publisher runs.
+
+    Does NOT reliably reject a truncated-but-parseable file; see
+    probe_duration_seconds() for why and for what that costs. That case is the
+    milder one anyway: such a file still carries the camera's real parameters,
+    so the SDP it produces is correct and only playback suffers.
+    """
+    return probe_stream_shape(video_file) is not None and bool(probe_duration_seconds(video_file))
+
+
 def generate_placeholder_video(
     output_path: Union[str, Path],
     text: str,

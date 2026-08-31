@@ -18,7 +18,7 @@ from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
 
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import generate_placeholder_video, probe_stream_shape
+from blinkbridge.ffmpeg import generate_placeholder_video, is_usable_clip, probe_stream_shape
 
 
 # How long to wait for a camera to upload a freshly taken snapshot before
@@ -697,8 +697,25 @@ class CameraManager:
     
         try:
             if file_name.exists() and not force:
-                log.debug(f"{camera_name}: skipping download, {file_name} exists")
-                return file_name
+                # Validate before reusing. The download path below checks what
+                # it writes, but this path hands back whatever is on disk, and
+                # PATH_VIDEOS can outlive the container -- a file truncated by a
+                # kill mid-download would otherwise be reused indefinitely. This
+                # clip also seeds the stream, and the publisher derives its RTSP
+                # SDP from the first thing it plays, so a bad file here is not a
+                # local failure: it mis-describes the stream for as long as the
+                # publisher runs.
+                if is_usable_clip(file_name):
+                    log.debug(f"{camera_name}: skipping download, {file_name} exists")
+                    return file_name
+                log.warning(
+                    f"{camera_name}: cached clip {file_name.name} is unreadable, "
+                    f"discarding it and downloading again"
+                )
+                try:
+                    file_name.unlink()
+                except OSError as e:
+                    log.warning(f"{camera_name}: could not delete unreadable cached clip: {e}")
         except OSError as e:
             log.warning(f"{camera_name}: error checking if file exists: {e}")
 
