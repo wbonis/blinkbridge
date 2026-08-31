@@ -38,6 +38,12 @@ services:
       # blinkbridge's ffmpeg publishes over UDP and 1440p frames arrive torn
       # ("invalid FU-A packet"). To revert, drop these two lines.
       - MTX_RTSPTRANSPORTS=tcp
+      # 2026-08-31: raise the per-reader write queue (default 512 packets,
+      # must be a power of two). A single 1440p keyframe split into 1200-byte
+      # RTP packets can overflow the default queue in one burst, which MediaMTX
+      # reports as "reader is too slow, discarding N frames" against the
+      # Frigate readers. To revert, drop this line.
+      - MTX_WRITEQUEUESIZE=2048
       - TZ=Europe/Berlin
     volumes:
       # This image carries no zoneinfo of its own, so TZ alone would leave its
