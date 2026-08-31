@@ -6,6 +6,7 @@ downloading video clips, and monitoring for motion detection events.
 import asyncio
 import json
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -806,12 +807,32 @@ class CameraManager:
             if not video_data:
                 raise ValueError("Empty video data received")
                 
-            with open(file_name, 'wb') as f:
-                f.write(video_data)
-                
-            # Verify file was written
-            if not file_name.exists() or file_name.stat().st_size == 0:
-                raise IOError("Failed to write video file or file is empty")
+            # Write beside the target and rename into place rather than
+            # writing over it. The publisher may be reading this very file: a
+            # clip stays queued for several plays now, so a second motion event
+            # arriving during that window used to truncate the file mid-read.
+            # FFmpeg reported "Invalid NAL unit size", then "moov atom not
+            # found", then "Impossible to open" and the publisher died.
+            #
+            # rename() is atomic and does not disturb an already-open
+            # descriptor: the running FFmpeg keeps reading the old inode to the
+            # end of its pass, and only the next open sees the new clip. Both
+            # are complete files, so either is safe to play.
+            tmp_name = file_name.with_suffix(file_name.suffix + '.part')
+            try:
+                with open(tmp_name, 'wb') as f:
+                    f.write(video_data)
+
+                if not tmp_name.exists() or tmp_name.stat().st_size == 0:
+                    raise IOError("Failed to write video file or file is empty")
+
+                os.replace(tmp_name, file_name)
+            except BaseException:
+                try:
+                    tmp_name.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
                 
             log.debug(f'{camera_name}: video saved ({file_name.stat().st_size} bytes)')
         except IOError as e:
