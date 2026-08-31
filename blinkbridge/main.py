@@ -17,7 +17,7 @@ from rich.logging import RichHandler
 
 from blinkbridge.blink import CameraManager
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import probe_stream_shape
+from blinkbridge.ffmpeg import probe_duration_seconds, probe_stream_shape
 from blinkbridge.stream_server import StreamServer
 from blinkbridge.web import BlinkBridgeWebServer
 
@@ -63,6 +63,8 @@ class Application:
         self.camera_starting_polls: Dict[str, int] = defaultdict(int)
         # When each camera's still was last refreshed from a fresh snapshot
         self.camera_last_snapshot: Dict[str, datetime] = {}
+        # Pending deferred still swaps, one task per camera
+        self.pending_still_swaps: Dict[str, asyncio.Task] = {}
 
     async def start_stream(self, camera_name: str, redownload: bool = False) -> Optional[StreamServer]:
         """Start a stream server for a camera using the Starting placeholder.
@@ -506,13 +508,9 @@ class Application:
         if new_clip:
             if current_state != CameraState.LIVE:
                 log.info(f"{camera_name}: clip received — going LIVE (was {current_state.value})")
-            ss.add_video(new_clip)
+            self._add_clip_with_repeats(camera_name, ss, new_clip)
             self.camera_states[camera_name] = CameraState.LIVE
             self.camera_starting_polls[camera_name] = 0
-            # The still now comes from this clip's last frame, so it is as
-            # fresh as a snapshot would make it. Restart the refresh timer
-            # instead of waking the camera again moments later.
-            self.camera_last_snapshot[camera_name] = datetime.now()
             return
 
         # Online, no new motion clip.
@@ -539,7 +537,7 @@ class Application:
                 clip = await self.cam_manager.save_latest_clip(camera_name)
                 if clip is not None:
                     log.info(f"{camera_name}: found historical clip — going LIVE")
-                    ss.add_video(clip)
+                    self._add_clip_with_repeats(camera_name, ss, clip)
                     self.camera_states[camera_name] = CameraState.LIVE
                     self.camera_starting_polls[camera_name] = 0
                     return
@@ -565,13 +563,83 @@ class Application:
                 clip = await self.cam_manager.save_latest_clip(camera_name)
                 if clip is not None:
                     log.info(f"{camera_name}: recovered from ERROR — going LIVE")
-                    ss.add_video(clip)
+                    self._add_clip_with_repeats(camera_name, ss, clip)
                     self.camera_states[camera_name] = CameraState.LIVE
                     self.camera_starting_polls[camera_name] = 0
             except Exception as e:
                 log.warning(f"{camera_name}: error during ERROR recovery check: {e}")
             return
     
+    def _add_clip_with_repeats(self, camera_name: str, ss: StreamServer, clip: Path) -> None:
+        """Queue a motion clip and let it repeat before the still takes over.
+
+        The stream is a concat loop, so a clip repeats for as long as it stays
+        queued. Historically the still replaced it about a second later, which
+        meant the clip played exactly once -- one pass of roughly 15 seconds,
+        and at the frame rate a detector downstream actually receives, too few
+        frames to recognise anything. Measured here: Frigate produced no event
+        from a 15 s clip played once, and produced one from the same clip left
+        looping.
+
+        So the still is deferred and swapped in by a background task after the
+        clip has had its repeats. The wait must not block the caller: this runs
+        inside the monitoring loop, and sleeping here would stall motion polling
+        and the stream watchdog for the whole duration.
+        """
+        # The still now comes from this clip's last frame, so it is as fresh as
+        # a snapshot would make it. Restart the refresh timer here rather than at
+        # one call site: a clip also arrives through the STARTING and ERROR
+        # recovery paths, and those left the timer running, so a refresh could
+        # fall due seconds after startup and cut the clip short.
+        self.camera_last_snapshot[camera_name] = datetime.now()
+
+        repeats = CONFIG.get('clip_repeats', 3)
+        try:
+            repeats = max(1, int(repeats))
+        except (TypeError, ValueError):
+            log.warning(f"{camera_name}: invalid clip_repeats {repeats!r}, using 1")
+            repeats = 1
+
+        duration = probe_duration_seconds(clip) if repeats > 1 else None
+
+        if repeats <= 1 or not duration:
+            # Either configured off, or the clip's length is unknown and there
+            # is nothing to time the swap against.
+            ss.add_video(clip)
+            return
+
+        ss.add_video(clip, defer_still=True)
+
+        # Cancel any swap still pending from a previous clip: that still has
+        # been replaced and swapping it in now would show stale footage.
+        self._cancel_still_swap(camera_name)
+        delay = repeats * duration
+        self.pending_still_swaps[camera_name] = asyncio.create_task(
+            self._swap_in_still_after(camera_name, ss, delay)
+        )
+        log.debug(
+            f"{camera_name}: clip queued for {repeats} plays "
+            f"({duration:.1f}s each), still follows in {delay:.1f}s"
+        )
+
+    async def _swap_in_still_after(self, camera_name: str, ss: StreamServer, delay: float) -> None:
+        """Put the still back on the stream after a deferred clip has repeated."""
+        try:
+            await asyncio.sleep(delay)
+            ss.swap_in_still()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"{camera_name}: failed to swap the still back in: {e}")
+        finally:
+            self.pending_still_swaps.pop(camera_name, None)
+
+    def _cancel_still_swap(self, camera_name: str) -> None:
+        """Drop a pending still swap for one camera, if any."""
+        task = self.pending_still_swaps.pop(camera_name, None)
+        if task is not None and not task.done():
+            task.cancel()
+
     def _snapshot_interval_minutes(self, camera_name: str) -> int:
         """Minutes between snapshot-driven still refreshes for one camera.
 
@@ -599,6 +667,13 @@ class Application:
         """
         interval = self._snapshot_interval_minutes(camera_name)
         if interval <= 0:
+            return
+
+        # A clip is on the stream and still has repeats to go. Refreshing now
+        # would replace live footage with a static snapshot mid-event, which is
+        # the opposite of what either feature is for.
+        if camera_name in self.pending_still_swaps:
+            log.debug(f"{camera_name}: clip still playing, deferring snapshot refresh")
             return
 
         now = datetime.now()
@@ -704,6 +779,9 @@ class Application:
         log.info("Note: FFmpeg 'Broken pipe' errors during shutdown are normal")
         self.running = False
 
+        for camera_name in list(self.pending_still_swaps):
+            self._cancel_still_swap(camera_name)
+
         for camera_name, ss in list(self.stream_servers.items()):
             try:
                 log.debug(f"{camera_name}: stopping stream")
@@ -757,6 +835,8 @@ class Application:
                 pass
             self._monitor_task = None
         # Stop all streams
+        for camera_name in list(self.pending_still_swaps):
+            self._cancel_still_swap(camera_name)
         for camera_name, ss in list(self.stream_servers.items()):
             try:
                 ss.close()

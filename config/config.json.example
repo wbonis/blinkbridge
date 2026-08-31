@@ -1,5 +1,6 @@
 {
     "still_video_duration": 0.5,
+    "clip_repeats": 3,
     "paths": {
       "videos": "/working",
       "concat": "/working",

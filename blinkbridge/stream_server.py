@@ -230,13 +230,19 @@ class StreamServer:
             f"{shape['audio_rate']}Hz/{shape['audio_channels']}ch"
         )
 
-    def add_video(self, file_name_input_video: Union[str, Path], still_only: bool=False) -> None:
+    def add_video(self, file_name_input_video: Union[str, Path], still_only: bool=False,
+                  defer_still: bool=False) -> None:
         """Add a video to the stream and create a still video from its last frame.
         
         Args:
             file_name_input_video: Path to the input video
             still_only: If True, only create still video without enqueueing the
                 full clip first. Used for initial stream setup (default: False)
+            defer_still: If True, build the still but leave the clip queued
+                instead of replacing it. The caller is then responsible for
+                calling swap_in_still() once the clip has played as often as
+                it wants. Used to give a downstream detector more than one
+                pass over the footage (default: False)
                 
         Raises:
             Exception: If still video creation fails
@@ -302,7 +308,8 @@ class StreamServer:
             if next_still_video.stat().st_size == 0:
                 raise ValueError(f"Still video is empty: {next_still_video}")
                 
-            self._enqueue_clip(next_still_video)
+            if not defer_still:
+                self._enqueue_clip(next_still_video)
 
             if self.current_still_video:
                 try:
@@ -394,6 +401,24 @@ class StreamServer:
                 log.debug(f"{self.stream_name}: could not delete previous still: {e}")
 
         return True
+
+    def swap_in_still(self) -> None:
+        """Put the current still back on the stream after a deferred clip.
+
+        Pairs with add_video(defer_still=True): the clip stays queued and the
+        concat loop repeats it until this is called. Safe to call when there is
+        no still -- that just leaves the clip playing.
+        """
+        if not self.current_still_video:
+            log.debug(f"{self.stream_name}: no still to swap in")
+            return
+        if not self.current_still_video.exists():
+            log.warning(
+                f"{self.stream_name}: still {self.current_still_video.name} is gone, "
+                f"leaving the clip queued"
+            )
+            return
+        self._enqueue_clip(self.current_still_video)
 
     def _sweep_orphaned_files(self) -> None:
         """Delete any still video and temp frame files left by a previous run."""

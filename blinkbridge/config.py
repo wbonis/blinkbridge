@@ -135,6 +135,13 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         # Set defaults for optional settings
         CONFIG.setdefault('log_level', 'INFO')
         CONFIG.setdefault('still_video_duration', 0.5)
+        # How many times a motion clip plays before the still takes over. 1 is
+        # the historical behaviour: the still replaced the clip about a second
+        # after it was queued, so the clip played exactly once. A detector
+        # downstream gets only that single pass to recognise anything, which
+        # measured too short here -- Frigate produced no event from a 15 s clip
+        # while producing them from the same clip left looping.
+        CONFIG.setdefault('clip_repeats', 3)
         CONFIG['cameras'].setdefault('enabled', [])
         CONFIG['cameras'].setdefault('disabled', [])
         CONFIG['cameras'].setdefault('max_failures', 3)
