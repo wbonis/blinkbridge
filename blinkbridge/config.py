@@ -142,6 +142,11 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         # measured too short here -- Frigate produced no event from a 15 s clip
         # while producing them from the same clip left looping.
         CONFIG.setdefault('clip_repeats', 3)
+        # Frame rate to encode the looping still at. None inherits the clip's
+        # rate. Forcing it low decouples the still's length from its encode
+        # cost, which matters because a longer still is what keeps the
+        # publisher from crossing a concat boundary several times a second.
+        CONFIG.setdefault('still_video_fps', None)
         CONFIG['cameras'].setdefault('enabled', [])
         CONFIG['cameras'].setdefault('disabled', [])
         CONFIG['cameras'].setdefault('max_failures', 3)

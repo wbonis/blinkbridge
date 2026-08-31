@@ -1,5 +1,6 @@
 {
     "still_video_duration": 0.5,
+    "still_video_fps": null,
     "clip_repeats": 3,
     "paths": {
       "videos": "/working",

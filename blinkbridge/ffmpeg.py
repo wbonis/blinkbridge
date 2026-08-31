@@ -518,7 +518,12 @@ class FrameToVideo:
                 raise ValueError(f"Missing required video parameters: {missing_params}")
             
             time_base_denominator = params_video['time_base'].split('/')[1]
-            fps_value = params_video['r_frame_rate']
+            # The still may be encoded at a lower frame rate than the clip it
+            # was cut from. Frame rate is not in the SDP and the concat stream
+            # already carries mixed rates from the clips themselves, so this
+            # changes nothing a reader is told -- it only decides how many
+            # frames have to be encoded for a still of a given length.
+            fps_value = str(CONFIG.get('still_video_fps') or params_video['r_frame_rate'])
         except (KeyError, IndexError, ValueError) as e:
             log.error(f"Invalid video parameters: {e}")
             raise ValueError(f"Invalid video parameters: {e}")
