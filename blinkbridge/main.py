@@ -725,24 +725,33 @@ class Application:
             try:
                 ss = self.stream_servers[camera_name]
 
-                # Two ways a stream can be dead. The process can be gone, which
-                # poll() sees; or the process can still be running while its
-                # connection to the RTSP server is half-closed, which it cannot.
-                # Only the second one is silent, so it is the one that costs
-                # hours -- see StreamServer.is_publisher_connected().
+                # Three ways a stream can be dead. The process can be gone,
+                # which poll() sees; the process can still be running while
+                # its connection to the RTSP server is half-closed, which it
+                # cannot; or the process can be alive AND connected but frozen
+                # asleep in -re pacing with nothing flowing -- see
+                # StreamServer.is_publisher_connected() and is_frozen(). The
+                # last two are silent, so they are the ones that cost hours.
                 process_alive = ss.is_running()
                 connected = ss.is_publisher_connected() if process_alive else None
+                frozen = ss.is_frozen() if (process_alive and connected is not False) else False
 
-                if process_alive and connected is not False:
+                if process_alive and connected is not False and not frozen:
                     ss.failure_detected = False
                     continue
 
                 # Log once when the failure is first detected.
                 if not ss.failure_detected:
                     ss.failure_detected = True
-                    reason = "stream stopped" if not process_alive else (
-                        "publisher still running but its connection is closed"
-                    )
+                    if not process_alive:
+                        reason = "stream stopped"
+                    elif frozen:
+                        reason = (
+                            "publisher frozen asleep in -re pacing "
+                            "(fd table stuck on deleted files, stream stalled)"
+                        )
+                    else:
+                        reason = "publisher still running but its connection is closed"
                     log.warning(f"{camera_name}: {reason} (failure count: {ss.failure_count + 1})")
 
                 # A half-closed publisher is still holding the process and the

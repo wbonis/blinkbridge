@@ -51,6 +51,11 @@ class StreamServer:
         self.failure_detected: bool = False  # True after first failure spotted, until restart attempted
         # Stream shape the running FFmpeg publisher wrote its RTSP SDP from.
         self.published_shape: Optional[Dict] = None
+        # Freeze detection state: the set of deleted-but-open media files last
+        # seen in the publisher's fd table, and when that exact set first
+        # appeared. See is_frozen().
+        self._frozen_deleted_set: Optional[frozenset] = None
+        self._frozen_since: Optional[datetime] = None
 
     def _run_server(self) -> str:
         """Start the FFmpeg RTSP streaming process.
@@ -525,6 +530,65 @@ class StreamServer:
         # Some other state (LISTEN, or something unrecognised). Not a
         # publisher socket we can reason about, so do not act on it.
         return None
+
+    # How long a deleted-but-open media file may sit unchanged in the
+    # publisher's fd table before that counts as a freeze. Deleted fds are
+    # normal for at most one pass of the current file (an atomic replace
+    # mid-read); Blink caps recordings at ~60 s, so 120 s is beyond any
+    # legitimate pass while far below the freeze's observed ~10 min self-heal.
+    FREEZE_THRESHOLD_SECONDS = 120
+
+    def _deleted_media_targets(self) -> frozenset:
+        """Deleted-but-still-open media files in the publisher's fd table."""
+        if self.process is None:
+            return frozenset()
+        targets = set()
+        try:
+            fd_dir = Path(f'/proc/{self.process.pid}/fd')
+            for fd in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if target.endswith(' (deleted)') and ('.mp4' in target or '.concat' in target):
+                    targets.add(target)
+        except OSError:
+            return frozenset()
+        return frozenset(targets)
+
+    def is_frozen(self) -> bool:
+        """Whether the publisher is stalled in -re pacing without being dead.
+
+        A publisher can freeze without dying: the concat demuxer's per-segment
+        offset accounting can intermittently hand -re a presentation window
+        far in the future, and FFmpeg then sleeps for minutes
+        (wchan=hrtimer_nanosleep) with the stream stalled. The process is
+        alive and the socket stays ESTABLISHED, so both checks above call it
+        healthy -- the state is invisible to them by construction. Captured
+        live and root-caused on the sibling ringbridge deployment (2026-08-31);
+        it self-heals only when the sleep expires, costing every clip in
+        between, while a restart recovers in seconds.
+
+        The observable signature from outside is the fd table: files replaced
+        on disk stay open as deleted inodes and the publisher never crosses a
+        segment boundary to release them. So: the same non-empty set of
+        deleted media fds persisting beyond FREEZE_THRESHOLD_SECONDS is a
+        freeze. A changing set is a publisher making progress; an empty set
+        resets the clock.
+        """
+        deleted = self._deleted_media_targets()
+        if not deleted:
+            self._frozen_deleted_set = None
+            self._frozen_since = None
+            return False
+
+        if deleted != self._frozen_deleted_set:
+            self._frozen_deleted_set = deleted
+            self._frozen_since = datetime.now()
+            return False
+
+        elapsed = (datetime.now() - self._frozen_since).total_seconds()
+        return elapsed >= self.FREEZE_THRESHOLD_SECONDS
 
     def is_running(self) -> bool:
         """Check if the streaming process is still running.
