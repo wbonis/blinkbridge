@@ -4,6 +4,7 @@ Provides the StreamServer class for managing FFmpeg-based RTSP streams.
 Handles video concatenation, still video creation, and stream lifecycle.
 """
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -134,12 +135,16 @@ class StreamServer:
             # Ensure directory exists
             PATH_CONCAT.mkdir(parents=True, exist_ok=True)
             
-            with open(concat_file, 'w') as f:
+            # Atomic like _enqueue_clip's write: only written at (re)start,
+            # but a restart can race a straggling old publisher.
+            tmp_file = concat_file.with_suffix(concat_file.suffix + '.tmp')
+            with open(tmp_file, 'w') as f:
                 f.write("ffconcat version 1.0\n")
                 # Reference next concat file twice for seamless looping
                 for _ in range(2):
                     f.write(f"file '{next_concat.resolve()}'\n")
                     f.write("option safe 0\n")  # Allow absolute paths
+            os.replace(tmp_file, concat_file)
         except IOError as e:
             log.error(f"{self.stream_name}: failed to create concat file: {e}")
             raise
@@ -179,9 +184,18 @@ class StreamServer:
         next_concat = PATH_CONCAT / f"{self.stream_name_sanitized}_next.concat"
 
         try:
-            with open(next_concat, 'w') as f:
+            # Written beside the target and renamed into place. The publisher
+            # re-parses this file at every concat entry boundary -- with a 2 s
+            # still, every ~2 s for the life of the stream. A plain truncating
+            # write leaves a window in which it reads an empty or half-written
+            # script, and the concat demuxer treats that as fatal: FFmpeg
+            # exits and takes the stream down. os.replace() is atomic, so the
+            # reader sees either the old script or the new one, never neither.
+            tmp_concat = next_concat.with_suffix(next_concat.suffix + '.tmp')
+            with open(tmp_concat, 'w') as f:
                 f.write("ffconcat version 1.0\n")
                 f.write(f"file '{video_file_name.resolve()}'\n")
+            os.replace(tmp_concat, next_concat)
         except IOError as e:
             log.error(f"{self.stream_name}: failed to write next concat file: {e}")
             raise
