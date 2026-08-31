@@ -150,8 +150,9 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['frigate_export'].setdefault('rtsp_port', CONFIG['rtsp_server']['port'])
         CONFIG['frigate_export'].setdefault('roles', ['detect', 'record'])
         CONFIG['frigate_export'].setdefault('detect_defaults', {})
-        CONFIG['frigate_export']['detect_defaults'].setdefault('width', 1280)
-        CONFIG['frigate_export']['detect_defaults'].setdefault('height', 720)
+        # No width/height defaults on purpose: the export measures each camera's
+        # real resolution and only falls back to these. Injecting 1280x720 here
+        # would turn "unset" into a guess that is wrong for any other model.
         CONFIG['frigate_export']['detect_defaults'].setdefault('fps', 1)
 
         # Optional BlinkBridge utility web server
