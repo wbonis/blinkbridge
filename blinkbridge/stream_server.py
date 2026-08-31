@@ -75,12 +75,23 @@ class StreamServer:
 
         ffmpeg_args = [
             'ffmpeg', *COMMON_FFMPEG_ARGS,
+            # +igndts+genpts patches the small timestamp overlaps at each
+            # -stream_loop wrap (audio and video never have exactly the same
+            # duration). Deliberately NO -fps_mode drop: under -c copy that is
+            # not a no-op -- it discards every video timestamp and has the
+            # muxer restamp the stream at ONE nominal rate, which cannot be
+            # right while a 5 fps still alternates with ~25 fps clips, so one
+            # of the two segments was always mis-paced on the wire. The concat
+            # demuxer's own offset timestamps are correct; consumers that pace
+            # off them (recording segmenters, go2rtc) need them. Likewise no
+            # -flush_packets 0: it only held the still's last packets back
+            # until clip packets pushed them out -- a burst at exactly the
+            # transition that matters, for no benefit over TCP.
             '-fflags', '+igndts+genpts',
             '-re',
             '-stream_loop', '-1',
             '-f', 'concat', '-safe', '0',
             '-i', str(input_concat_file.resolve()),
-            '-flush_packets', '0',
             '-c:v', 'copy', '-c:a', 'copy',
             # FFmpeg's RTSP muxer defaults to 1472-byte packets, above
             # MediaMTX's 1440 limit, so it logs "RTP packets are too big
@@ -96,7 +107,6 @@ class StreamServer:
             # "method SETUP failed: 461 (Unsupported Transport)" on every
             # publisher start before falling back.
             '-rtsp_transport', 'tcp',
-            '-fps_mode', 'drop',
             output_url
         ]
         
