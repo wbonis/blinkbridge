@@ -61,6 +61,8 @@ class Application:
         # Per-camera operational state and starting-poll counter
         self.camera_states: Dict[str, CameraState] = {}
         self.camera_starting_polls: Dict[str, int] = defaultdict(int)
+        # When each camera's still was last refreshed from a fresh snapshot
+        self.camera_last_snapshot: Dict[str, datetime] = {}
 
     async def start_stream(self, camera_name: str, redownload: bool = False) -> Optional[StreamServer]:
         """Start a stream server for a camera using the Starting placeholder.
@@ -507,12 +509,19 @@ class Application:
             ss.add_video(new_clip)
             self.camera_states[camera_name] = CameraState.LIVE
             self.camera_starting_polls[camera_name] = 0
+            # The still now comes from this clip's last frame, so it is as
+            # fresh as a snapshot would make it. Restart the refresh timer
+            # instead of waking the camera again moments later.
+            self.camera_last_snapshot[camera_name] = datetime.now()
             return
 
         # Online, no new motion clip.
 
         if current_state == CameraState.LIVE:
-            # Still online and streaming — nothing to do.
+            # Still online and streaming. The looping still is the last frame of
+            # the last clip, so without this it keeps showing whatever was in
+            # frame when that clip ended until the next motion event.
+            await self._refresh_still_if_due(camera_name, ss)
             return
 
         if current_state == CameraState.OFFLINE:
@@ -563,6 +572,59 @@ class Application:
                 log.warning(f"{camera_name}: error during ERROR recovery check: {e}")
             return
     
+    def _snapshot_interval_minutes(self, camera_name: str) -> int:
+        """Minutes between snapshot-driven still refreshes for one camera.
+
+        Per-camera because the trade-off differs per model: a mains-powered
+        camera can refresh often, a battery-powered one pays for every wake-up.
+        0 (the default) disables the refresh for that camera.
+        """
+        cfg = CONFIG.get('snapshot_refresh', {})
+        if not cfg.get('enabled', False):
+            return 0
+
+        per_camera = cfg.get('per_camera', {})
+        value = per_camera.get(camera_name, cfg.get('default_interval_minutes', 0))
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            log.warning(f"{camera_name}: invalid snapshot interval {value!r}, disabling refresh")
+            return 0
+
+    async def _refresh_still_if_due(self, camera_name: str, ss: StreamServer) -> None:
+        """Refresh this camera's looping still from a new snapshot, if it is due.
+
+        Only called for a LIVE camera: in the other states the stream shows a
+        placeholder screen that must not be overwritten by camera footage.
+        """
+        interval = self._snapshot_interval_minutes(camera_name)
+        if interval <= 0:
+            return
+
+        now = datetime.now()
+        last = self.camera_last_snapshot.get(camera_name)
+        if last is not None and now - last < timedelta(minutes=interval):
+            return
+
+        # Record the attempt before making it. A camera that fails to deliver a
+        # snapshot must not be retried on the next poll a few seconds later --
+        # every attempt wakes it, and that is the expensive part.
+        self.camera_last_snapshot[camera_name] = now
+
+        try:
+            image = await self.cam_manager.snap_and_fetch_thumbnail(camera_name)
+        except Exception as e:
+            log.warning(f"{camera_name}: snapshot refresh failed: {e}")
+            return
+
+        if image is None:
+            return
+
+        camera_name_sanitized = camera_name.replace(' ', '_').lower()
+        shape_source = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
+        if ss.refresh_still_from_image(image, shape_source):
+            log.info(f"{camera_name}: still refreshed from a new snapshot")
+
     async def _restart_failed_streams(self) -> None:
         """Restart any failed stream servers.
         

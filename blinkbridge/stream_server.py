@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import StillVideoCreator, probe_stream_shape
+from blinkbridge.ffmpeg import (
+    FrameToVideo,
+    StillVideoCreator,
+    StreamParameters,
+    probe_stream_shape,
+)
 from blinkbridge.utils import wait_until_file_open
 
 
@@ -318,6 +323,76 @@ class StreamServer:
                 log.warning(f"{self.stream_name}: failed to cleanup still video: {cleanup_err}")
             raise
     
+    def refresh_still_from_image(
+        self, image_file: Union[str, Path], shape_source: Union[str, Path]
+    ) -> bool:
+        """Replace the looping still with one built from an arbitrary image.
+
+        The still normally comes from the last frame of the last motion clip,
+        so between events it shows whatever happened to be in frame when that
+        clip ended -- for hours, until the next event. This puts a freshly
+        taken snapshot up instead.
+
+        Stream parameters are taken from shape_source (the camera's own most
+        recent clip), never from the image, so the new still matches what the
+        publisher already announced in the RTSP SDP -- the same invariant
+        get_placeholder() maintains. The image is scaled to the stream's
+        resolution: Blink thumbnails are half the video's dimensions, so the
+        result is softer than a still cut from the video itself.
+
+        Args:
+            image_file: JPEG to build the still from.
+            shape_source: Video whose parameters the still must match.
+
+        Returns:
+            True if the still was replaced, False if it was left as it was.
+        """
+        image_file = Path(image_file)
+        shape_source = Path(shape_source)
+
+        if not image_file.exists():
+            log.warning(f"{self.stream_name}: snapshot image not found: {image_file}")
+            return False
+        if not shape_source.exists():
+            log.debug(f"{self.stream_name}: no clip to take still parameters from")
+            return False
+
+        dt = datetime.now()
+        next_still_video = PATH_VIDEOS / f"{self.stream_name_sanitized}_still_{dt.strftime('%Y-%m-%d_%H-%M-%S-%f')}.mp4"
+
+        try:
+            params_audio, params_video = StreamParameters(shape_source).wait()
+            if not params_video:
+                raise ValueError(f"no H264 stream in {shape_source}")
+
+            FrameToVideo(
+                image_file, params_video, params_audio,
+                output_duration=CONFIG['still_video_duration'],
+                file_name_output_video=next_still_video,
+            ).wait()
+
+            if not next_still_video.exists() or next_still_video.stat().st_size == 0:
+                raise FileNotFoundError(f"still video not created: {next_still_video}")
+        except Exception as e:
+            log.warning(f"{self.stream_name}: could not build still from snapshot: {e}")
+            try:
+                next_still_video.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+        self._enqueue_clip(next_still_video)
+
+        previous = self.current_still_video
+        self.current_still_video = next_still_video
+        if previous and previous != next_still_video:
+            try:
+                previous.unlink()
+            except OSError as e:
+                log.debug(f"{self.stream_name}: could not delete previous still: {e}")
+
+        return True
+
     def _sweep_orphaned_files(self) -> None:
         """Delete any still video and temp frame files left by a previous run."""
         for pattern in (

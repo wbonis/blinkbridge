@@ -155,6 +155,14 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         # would turn "unset" into a guess that is wrong for any other model.
         CONFIG['frigate_export']['detect_defaults'].setdefault('fps', 1)
 
+        # Optional periodic refresh of the looping still from a fresh camera
+        # snapshot. Off by default: each refresh wakes the camera, which costs
+        # battery on the battery-powered models.
+        CONFIG.setdefault('snapshot_refresh', {})
+        CONFIG['snapshot_refresh'].setdefault('enabled', False)
+        CONFIG['snapshot_refresh'].setdefault('default_interval_minutes', 0)
+        CONFIG['snapshot_refresh'].setdefault('per_camera', {})
+
         # Optional BlinkBridge utility web server
         CONFIG.setdefault('web', {})
         CONFIG['web'].setdefault('enabled', False)

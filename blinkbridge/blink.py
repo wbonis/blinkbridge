@@ -21,6 +21,12 @@ from blinkbridge.config import *
 from blinkbridge.ffmpeg import generate_placeholder_video, probe_stream_shape
 
 
+# How long to wait for a camera to upload a freshly taken snapshot before
+# giving up: attempts x delay. Blink cameras typically need a few seconds.
+SNAPSHOT_POLL_ATTEMPTS = 6
+SNAPSHOT_POLL_DELAY_SECONDS = 2.0
+
+
 log = logging.getLogger(__name__)
 
 
@@ -348,6 +354,71 @@ class CameraManager:
         'offline':  ('offline_placeholder',  'OFFLINE',     'black', 'red'),
         'error':    ('error_placeholder',    'ERROR',       'black', 'red'),
     }
+
+    async def snap_and_fetch_thumbnail(self, camera_name: str) -> Optional[Path]:
+        """Take a fresh photo on the camera and save it as a JPEG.
+
+        Blink only refreshes a camera's thumbnail on its own events, so the
+        cached one can be hours old -- measured at 123 minutes on both cameras
+        of the instance this was written for, which is why simply re-fetching
+        the existing thumbnail does not help. Only snap_picture() produces a
+        current image, and it wakes the camera to do so. That costs battery on
+        the battery-powered models, so callers must rate-limit; see
+        Application._refresh_still_if_due().
+
+        Returns:
+            Path to the saved JPEG, or None if the camera is unknown, the
+            snapshot did not arrive in time, or the file could not be written.
+        """
+        camera = self.blink.cameras.get(camera_name) if self.blink.cameras else None
+        if camera is None:
+            log.debug(f"{camera_name}: not in Blink\'s camera list, cannot take a snapshot")
+            return None
+
+        thumbnail_before = camera.thumbnail
+
+        try:
+            await camera.snap_picture()
+        except Exception as e:
+            log.warning(f"{camera_name}: snap_picture failed: {e}")
+            return None
+
+        # The camera uploads asynchronously, so the thumbnail URL only changes a
+        # few seconds later. Poll for a different URL rather than saving the old
+        # image again and believing it is new.
+        for _ in range(SNAPSHOT_POLL_ATTEMPTS):
+            await asyncio.sleep(SNAPSHOT_POLL_DELAY_SECONDS)
+            try:
+                await self.blink.refresh(force=True)
+            except Exception as e:
+                log.debug(f"{camera_name}: refresh while waiting for snapshot failed: {e}")
+                continue
+            if camera.thumbnail and camera.thumbnail != thumbnail_before:
+                break
+        else:
+            log.debug(
+                f"{camera_name}: thumbnail unchanged {SNAPSHOT_POLL_ATTEMPTS * SNAPSHOT_POLL_DELAY_SECONDS:.0f}s "
+                f"after snap_picture, leaving the current still in place"
+            )
+            return None
+
+        camera_name_sanitized = camera_name.replace(' ', '_').lower()
+        snapshot_path = PATH_VIDEOS / f"{camera_name_sanitized}_snapshot.jpg"
+        try:
+            await camera.image_to_file(str(snapshot_path))
+        except Exception as e:
+            log.warning(f"{camera_name}: could not save snapshot image: {e}")
+            return None
+
+        try:
+            if not snapshot_path.exists() or snapshot_path.stat().st_size == 0:
+                log.warning(f"{camera_name}: snapshot image is missing or empty")
+                return None
+        except OSError as e:
+            log.warning(f"{camera_name}: could not check snapshot image: {e}")
+            return None
+
+        return snapshot_path
 
     def _generate_placeholders(self) -> None:
         """Generate the shared fallback placeholder videos.

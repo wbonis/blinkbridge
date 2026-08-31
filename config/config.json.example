@@ -41,5 +41,10 @@
       "host": "0.0.0.0",
       "port": 8765
     },
+    "snapshot_refresh": {
+      "enabled": false,
+      "default_interval_minutes": 0,
+      "per_camera": {}
+    },
     "log_level": "INFO"
 }
