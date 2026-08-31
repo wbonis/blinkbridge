@@ -441,23 +441,6 @@ class StreamServer:
                 except OSError as e:
                     log.warning(f"{self.stream_name}: could not remove orphaned file {path.name}: {e}")
 
-    def swap_to_placeholder(self, placeholder_video: Union[str, Path]) -> None:
-        """Replace the current stream content with a placeholder video.
-
-        Writes the placeholder path directly into the next-concat file so that
-        FFmpeg picks it up on the next loop iteration. Unlike add_video(), this
-        does NOT create a still from the placeholder — the placeholder is already
-        a short loopable clip.
-
-        Args:
-            placeholder_video: Path to a pre-generated placeholder video
-                               (Starting, Offline, or Error screen).
-        """
-        try:
-            self._enqueue_clip(placeholder_video)
-        except Exception as e:
-            log.error(f"{self.stream_name}: failed to swap to placeholder: {e}")
-
     # /proc/net/tcp state codes. Only the terminal ones justify a restart:
     # a socket still negotiating is not a failure, it is a publisher that has
     # not finished connecting.
