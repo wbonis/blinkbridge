@@ -18,7 +18,12 @@ from blinkpy.blinkpy import Blink
 from blinkpy.helpers.util import json_load
 
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import generate_placeholder_video, is_usable_clip, probe_stream_shape
+from blinkbridge.ffmpeg import (
+    generate_placeholder_video,
+    is_usable_clip,
+    probe_stream_shape,
+    sdp_fields,
+)
 
 
 # How long to wait for a camera to upload a freshly taken snapshot before
@@ -494,7 +499,15 @@ class CameraManager:
         if shape is None:
             return fallback
 
-        if self.camera_placeholder_shapes.get(camera_name) != shape:
+        # Compared on SDP fields, not the whole shape. Blink's clips vary in
+        # frame rate between recordings, and rebuilding on that would re-encode
+        # three placeholders at full camera resolution every time a clip with a
+        # slightly different rate arrives -- which is exactly when a motion clip
+        # is being spliced and the publisher needs the CPU. Frame rate is not in
+        # the SDP and the concat stream already carries mixed rates from the
+        # clips themselves, so matching it buys nothing.
+        known = self.camera_placeholder_shapes.get(camera_name)
+        if known is None or sdp_fields(known) != sdp_fields(shape):
             self._generate_camera_placeholders(camera_name, camera_name_sanitized, shape)
 
         return self.camera_placeholders.get(camera_name, {}).get(state, fallback)

@@ -144,6 +144,28 @@ def is_usable_clip(video_file: Union[str, Path]) -> bool:
     return probe_stream_shape(video_file) is not None and bool(probe_duration_seconds(video_file))
 
 
+def sdp_fields(shape: Dict) -> tuple:
+    """The parts of a stream shape that a reader is told about in the RTSP SDP.
+
+    Resolution and H264 profile/level travel in sprop-parameter-sets and
+    profile-level-id, and the AAC layout in the audio fmtp. Frame rate is not
+    described there -- it is carried in the timestamps -- so two files that
+    differ only in frame rate describe the same stream.
+
+    That distinction is what this exists for. Blink clips genuinely vary in
+    frame rate between recordings (343/12 and 25/1 have both been observed on
+    one camera within an hour), so comparing whole shapes treats every such
+    clip as a new stream. Compare these fields instead wherever the question is
+    "does this still describe the same stream", and use the full shape only
+    where the value is actually needed, such as encoder flags.
+    """
+    return (
+        shape['width'], shape['height'],
+        shape['profile'], shape['level'],
+        shape['audio_rate'], shape['audio_channels'],
+    )
+
+
 def generate_placeholder_video(
     output_path: Union[str, Path],
     text: str,
