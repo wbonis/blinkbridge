@@ -580,7 +580,7 @@ class Application:
         0 (the default) disables the refresh for that camera.
         """
         cfg = CONFIG.get('snapshot_refresh', {})
-        if not cfg.get('enabled', False):
+        if not cfg.get('enabled', True):
             return 0
 
         per_camera = cfg.get('per_camera', {})

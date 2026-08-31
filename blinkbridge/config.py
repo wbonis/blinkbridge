@@ -156,10 +156,16 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['frigate_export']['detect_defaults'].setdefault('fps', 1)
 
         # Optional periodic refresh of the looping still from a fresh camera
-        # snapshot. Off by default: each refresh wakes the camera, which costs
-        # battery on the battery-powered models.
+        # snapshot. Each refresh wakes the camera, which costs battery on the
+        # battery-powered models, so nothing runs unless an interval is set:
+        # with the section absent, default_interval_minutes is 0 and per_camera
+        # is empty, which disables it for every camera on its own. 'enabled'
+        # therefore defaults to True rather than False -- it is a master switch
+        # for turning a configured setup off, and defaulting it to False would
+        # only mean that a config setting nothing but intervals silently does
+        # nothing.
         CONFIG.setdefault('snapshot_refresh', {})
-        CONFIG['snapshot_refresh'].setdefault('enabled', False)
+        CONFIG['snapshot_refresh'].setdefault('enabled', True)
         CONFIG['snapshot_refresh'].setdefault('default_interval_minutes', 0)
         CONFIG['snapshot_refresh'].setdefault('per_camera', {})
 
