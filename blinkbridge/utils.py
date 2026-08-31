@@ -211,5 +211,13 @@ def wait_until_file_open(file_path: Union[str, Path], pid: int, timeout: float=1
             log.error(f"Error during sleep: {e}")
             break
 
-    log.error(f"Timeout waiting for process {pid} to open {file_path} after {timeout}s")
-    raise TimeoutError(f"Timeout waiting for process {pid} to open {file_path}")
+    # Debug, not error: the only caller treats expiry as a normal outcome and
+    # logs it at warning with the camera name attached. Logging it as an error
+    # here says "something broke" about a wait that is expected to expire.
+    log.debug(f"Timeout waiting for process {pid} to open {file_path} after {timeout}s")
+    raise TimeoutError(
+        f"process {pid} did not open {file_path} within {timeout}s -- "
+        f"the publisher plays the concat in real time, so it only opens a newly "
+        f"queued file once the current one has finished; a clip longer than "
+        f"{timeout}s still playing will exceed this"
+    )
