@@ -24,6 +24,11 @@ services:
     tty: true # for color logs
     environment:
       - BLINKBRIDGE_CONFIG=/config/config.json
+      # Without this the container runs on UTC while the host is CEST, so every
+      # log timestamp is two hours off from anything you compare it against --
+      # host clock, Frigate's UI, the Blink app. zoneinfo is already in the
+      # image (ffmpeg pulls it in), so only the variable is needed.
+      - TZ=Europe/Berlin
   mediamtx:
     image: bluenviron/mediamtx
     container_name: mediamtx
@@ -33,5 +38,11 @@ services:
       # blinkbridge's ffmpeg publishes over UDP and 1440p frames arrive torn
       # ("invalid FU-A packet"). To revert, drop these two lines.
       - MTX_RTSPTRANSPORTS=tcp
+      - TZ=Europe/Berlin
+    volumes:
+      # This image carries no zoneinfo of its own, so TZ alone would leave its
+      # Go runtime on UTC. Correlating its session logs against blinkbridge's is
+      # most of what they are read for, so both need the same clock.
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
     ports:
       - 8554:8554
