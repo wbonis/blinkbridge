@@ -28,6 +28,10 @@ log = logging.getLogger(__name__)
 MIN_BLINK_THROTTLE = 2
 # How often to log summary status at INFO level (seconds)
 LOG_INTERVAL_SECONDS = 30
+# How long to leave a clip queued when its length could not be probed. Only a
+# fallback: without a length there is nothing to base the repeat count on, but
+# the still still has to come back eventually.
+STILL_SWAP_FALLBACK_SECONDS = 30
 # Grace period for FFmpeg processes to shutdown cleanly (seconds)
 SHUTDOWN_GRACE_PERIOD = 0.2
 
@@ -600,13 +604,22 @@ class Application:
             log.warning(f"{camera_name}: invalid clip_repeats {repeats!r}, using 1")
             repeats = 1
 
-        duration = probe_duration_seconds(clip) if repeats > 1 else None
-
-        if repeats <= 1 or not duration:
-            # Either configured off, or the clip's length is unknown and there
-            # is nothing to time the swap against.
-            ss.add_video(clip)
-            return
+        # The still is ALWAYS deferred, never written by add_video itself. If it
+        # were, the wait for the publisher expiring would make _enqueue_clip()
+        # overwrite a clip the publisher has not opened yet -- the clip would
+        # never play at all, and nothing would say so. The comment on that path
+        # reads "video might still work", which is exactly what does not happen.
+        # Deferring means a clip that has not been reached yet stays queued and
+        # plays when the publisher gets to it.
+        duration = probe_duration_seconds(clip)
+        if duration:
+            delay = repeats * duration
+        else:
+            delay = STILL_SWAP_FALLBACK_SECONDS
+            log.debug(
+                f"{camera_name}: clip length unknown, showing the still again "
+                f"in {delay}s"
+            )
 
         ss.add_video(clip, defer_still=True)
 
@@ -618,8 +631,7 @@ class Application:
             self._swap_in_still_after(camera_name, ss, delay)
         )
         log.debug(
-            f"{camera_name}: clip queued for {repeats} plays "
-            f"({duration:.1f}s each), still follows in {delay:.1f}s"
+            f"{camera_name}: clip queued, still follows in {delay:.1f}s"
         )
 
     async def _swap_in_still_after(self, camera_name: str, ss: StreamServer, delay: float) -> None:
