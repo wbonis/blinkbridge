@@ -181,6 +181,16 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['snapshot_refresh'].setdefault('default_interval_minutes', 0)
         CONFIG['snapshot_refresh'].setdefault('per_camera', {})
 
+        # Optional burn-in of the clip's Blink-cloud recording time (top-left).
+        # Off by default: 'still' is nearly free (the still is re-encoded
+        # anyway), but 'clip' forces a re-encode of every motion clip, which
+        # otherwise streams with -c:v copy. 'format' is a strftime pattern
+        # applied to the recording time converted to the container's local TZ.
+        CONFIG.setdefault('timestamp_overlay', {})
+        CONFIG['timestamp_overlay'].setdefault('still', False)
+        CONFIG['timestamp_overlay'].setdefault('clip', False)
+        CONFIG['timestamp_overlay'].setdefault('format', '%d.%m.%Y %H:%M:%S')
+
         # Optional BlinkBridge utility web server
         CONFIG.setdefault('web', {})
         CONFIG['web'].setdefault('enabled', False)

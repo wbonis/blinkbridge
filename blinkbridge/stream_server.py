@@ -16,6 +16,7 @@ from blinkbridge.ffmpeg import (
     FrameToVideo,
     StillVideoCreator,
     StreamParameters,
+    burn_timestamp_into_clip,
     probe_stream_shape,
     sdp_fields,
 )
@@ -47,6 +48,10 @@ class StreamServer:
         self.stream_name: str = stream_name
         self.stream_name_sanitized: str = stream_name.replace(' ', '_').lower()
         self.current_still_video: Optional[Path] = None
+        # When timestamp_overlay.clip is on, the streamed clip is a re-encoded
+        # copy with the timestamp burned in; track it so the previous one can
+        # be deleted once superseded, same lifecycle as current_still_video.
+        self.current_overlay_clip: Optional[Path] = None
         self.process: Optional[subprocess.Popen] = None
         self.failure_detected: bool = False  # True after first failure spotted, until restart attempted
         # Stream shape the running FFmpeg publisher wrote its RTSP SDP from.
@@ -273,9 +278,10 @@ class StreamServer:
         )
 
     def add_video(self, file_name_input_video: Union[str, Path], still_only: bool=False,
-                  defer_still: bool=False) -> None:
+                  defer_still: bool=False, still_overlay_text: Optional[str]=None,
+                  clip_overlay_text: Optional[str]=None) -> None:
         """Add a video to the stream and create a still video from its last frame.
-        
+
         Args:
             file_name_input_video: Path to the input video
             still_only: If True, only create still video without enqueueing the
@@ -285,11 +291,17 @@ class StreamServer:
                 calling swap_in_still() once the clip has played as often as
                 it wants. Used to give a downstream detector more than one
                 pass over the footage (default: False)
-                
+            still_overlay_text: If set, burn this text into the still's
+                top-left corner. Cheap -- the still is re-encoded anyway.
+            clip_overlay_text: If set, stream a re-encoded copy of the clip
+                with this text burned in instead of the original. Expensive
+                (forces a per-clip re-encode); on failure the original clip is
+                streamed unchanged.
+
         Raises:
             Exception: If still video creation fails
             FileNotFoundError: If still video file wasn't created
-            
+
         Note:
             Process flow:
             1. Enqueue full clip (unless still_only)
@@ -299,15 +311,21 @@ class StreamServer:
             5. Enqueue still video
             6. Delete previous still video
         """
+        # The clip actually put on the wire. Defaults to the input; becomes a
+        # burned-in re-encode when clip_overlay_text is set and succeeds. The
+        # publisher-open wait below must track THIS file, not the original.
+        enqueued_clip = Path(file_name_input_video)
         try:
             file_name_input_video = Path(file_name_input_video)
-            
+
             # Verify input video exists
             if not file_name_input_video.exists():
                 raise FileNotFoundError(f"Input video not found: {file_name_input_video}")
-                
+
             if not still_only:
-                self._enqueue_clip(file_name_input_video)
+                if clip_overlay_text:
+                    enqueued_clip = self._make_overlay_clip(file_name_input_video, clip_overlay_text)
+                self._enqueue_clip(enqueued_clip)
         except FileNotFoundError as e:
             log.error(f"{self.stream_name}: {e}")
             raise
@@ -321,20 +339,23 @@ class StreamServer:
         try:
             # Ensure videos directory exists
             PATH_VIDEOS.mkdir(parents=True, exist_ok=True)
-            
+
+            # The still is always cut from the ORIGINAL clip and draws its own
+            # overlay, so it never inherits a burned-in clip overlay twice.
             svc = StillVideoCreator(
                 file_name_input_video,
                 output_duration=CONFIG['still_video_duration'],
-                file_name_still_video=next_still_video
+                file_name_still_video=next_still_video,
+                overlay_text=still_overlay_text,
             )
-            
+
             if not still_only:
                 log.debug(f"{self.stream_name}: waiting for new video to start")
                 try:
                     if self.process is None:
                         log.warning(f"{self.stream_name}: process not started, cannot wait for video to open")
                     else:
-                        wait_until_file_open(file_name_input_video, self.process.pid)
+                        wait_until_file_open(enqueued_clip, self.process.pid)
                 except TimeoutError as e:
                     log.warning(f"{self.stream_name}: timeout waiting for video to open: {e}")
                     # Continue anyway - video might still work
@@ -373,7 +394,32 @@ class StreamServer:
             except Exception as cleanup_err:
                 log.warning(f"{self.stream_name}: failed to cleanup still video: {cleanup_err}")
             raise
-    
+
+    def _make_overlay_clip(self, original_clip: Path, overlay_text: str) -> Path:
+        """Re-encode the clip with a burned-in timestamp; fall back to original.
+
+        Returns the path to stream: the timestamped re-encode on success, or
+        the untouched original clip if the re-encode could not be produced (a
+        bad probe, no font, ffmpeg failure). Uses a unique per-event filename
+        and deletes the previous overlay clip, the same lifecycle as the still
+        -- so the publisher, which may still hold the old one open, keeps
+        reading it to the end while new readers see the new file.
+        """
+        dt = datetime.now()
+        overlay_path = PATH_VIDEOS / f"{self.stream_name_sanitized}_tsclip_{dt.strftime('%Y-%m-%d_%H-%M-%S-%f')}.mp4"
+        if not burn_timestamp_into_clip(original_clip, overlay_text, overlay_path):
+            log.warning(f"{self.stream_name}: clip overlay failed, streaming original clip")
+            return original_clip
+
+        previous = self.current_overlay_clip
+        self.current_overlay_clip = overlay_path
+        if previous and previous != overlay_path:
+            try:
+                previous.unlink()
+            except OSError as e:
+                log.debug(f"{self.stream_name}: could not delete previous overlay clip: {e}")
+        return overlay_path
+
     def refresh_still_from_image(
         self, image_file: Union[str, Path], shape_source: Union[str, Path]
     ) -> bool:
@@ -467,6 +513,7 @@ class StreamServer:
         for pattern in (
             f"{self.stream_name_sanitized}_still_*.mp4",
             f"{self.stream_name_sanitized}_still_*.frame.jpg",
+            f"{self.stream_name_sanitized}_tsclip_*.mp4",
         ):
             for path in PATH_VIDEOS.glob(pattern):
                 try:

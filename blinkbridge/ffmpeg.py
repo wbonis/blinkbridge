@@ -12,6 +12,7 @@ import logging
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
@@ -19,6 +20,54 @@ from blinkbridge.config import *
 
 
 log = logging.getLogger(__name__)
+
+
+def format_overlay_text(cloud_time_iso: Optional[str], fmt: str = '%d.%m.%Y %H:%M:%S') -> Optional[str]:
+    """Format a Blink-cloud ISO timestamp for burn-in, in the container's TZ.
+
+    Blink reports the recording time as an ISO string in UTC
+    (e.g. '2026-09-01T08:24:41+00:00'). The container runs on the host TZ
+    (TZ=Europe/Berlin in compose), so astimezone() with no argument converts
+    to that local zone -- the time the operator recognises. Returns None if
+    the timestamp is missing or unparseable, so the caller simply skips the
+    overlay rather than burning in a wrong or empty value.
+    """
+    if not cloud_time_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(cloud_time_iso).replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        log.debug(f"format_overlay_text: cannot parse {cloud_time_iso!r}")
+        return None
+    try:
+        return dt.astimezone().strftime(fmt)
+    except (ValueError, TypeError) as e:
+        log.debug(f"format_overlay_text: cannot format {cloud_time_iso!r}: {e}")
+        return None
+
+
+def _drawtext_filter(text: str) -> Optional[str]:
+    """Build an FFmpeg drawtext filter that burns `text` into the top-left.
+
+    Font size scales with the frame height (h/22) so one filter reads well on
+    every Blink model from 640x360 to 1440p. A semi-transparent box keeps the
+    text legible over any scene. Returns None if no system font is available,
+    so the caller renders the video without the overlay rather than failing.
+    """
+    font_path = _find_system_font()
+    if not font_path:
+        log.warning("_drawtext_filter: no system font found, skipping timestamp overlay")
+        return None
+    # drawtext treats ':' and '\' as syntax and '%' as a strftime escape;
+    # escape them so a literal time string ("10:24:41") renders verbatim.
+    safe = text.replace('\\', '\\\\').replace(':', '\\:').replace('%', '\\%').replace("'", "’")
+    return (
+        f"drawtext=fontfile='{font_path}'"
+        f":text='{safe}'"
+        f":fontcolor=white:fontsize=h/22"
+        f":box=1:boxcolor=black@0.5:boxborderw=8"
+        f":x=12:y=12"
+    )
 
 
 def _find_system_font() -> Optional[str]:
@@ -480,16 +529,19 @@ class FrameToVideo:
                  image_file_name: Union[str, Path], 
                  params_video: Dict, 
                  params_audio: Dict, 
-                 output_duration: float=1, 
-                 file_name_output_video: Union[str, Path]="output.mp4"):
+                 output_duration: float=1,
+                 file_name_output_video: Union[str, Path]="output.mp4",
+                 overlay_text: Optional[str]=None):
         """Initialize FFmpeg subprocess to create video from image.
-        
+
         Args:
             image_file_name: Path to the input image file
             params_video: Video stream parameters from StreamParameters
             params_audio: Audio stream parameters from StreamParameters
             output_duration: Duration of output video in seconds (default: 1)
             file_name_output_video: Path for output video (default: "output.mp4")
+            overlay_text: If set, burn this text into the top-left corner.
+                Nearly free here since the still is re-encoded anyway.
             
         Raises:
             FileNotFoundError: If image file doesn't exist or FFmpeg not found
@@ -548,6 +600,12 @@ class FrameToVideo:
             log.error(f"Failed to create output directory: {e}")
             raise
         
+        vf = f"scale={params_video['width']}:{params_video['height']},fps={fps_value}"
+        if overlay_text:
+            overlay_vf = _drawtext_filter(overlay_text)
+            if overlay_vf:
+                vf = f"{vf},{overlay_vf}"
+
         ffmpeg_params = [
             'ffmpeg', *COMMON_FFMPEG_ARGS,
             '-loop', '1', '-i', str(image_file_name),
@@ -555,7 +613,7 @@ class FrameToVideo:
             '-c:v', params_video['codec_name'],
             '-pix_fmt', params_video['pix_fmt'],
             '-t', str(output_duration),
-            '-vf', f"scale={params_video['width']}:{params_video['height']},fps={fps_value}",
+            '-vf', vf,
             '-b:v', params_video['bit_rate'],
             '-profile:v', params_video['profile'],
             '-level:v', params_video['level'],
@@ -611,17 +669,19 @@ class StillVideoCreator:
     asynchronously in a separate thread.
     """
     
-    def __init__(self, 
-                 file_name_input_video: Union[str, Path], 
-                 output_duration: float=1, 
-                 file_name_still_video: Union[str, Path]="output.mp4"):
+    def __init__(self,
+                 file_name_input_video: Union[str, Path],
+                 output_duration: float=1,
+                 file_name_still_video: Union[str, Path]="output.mp4",
+                 overlay_text: Optional[str]=None):
         """Initialize and start still video creation in background thread.
-        
+
         Args:
             file_name_input_video: Path to source video file
             output_duration: Duration of output still video in seconds (default: 1)
             file_name_still_video: Path for output still video (default: "output.mp4")
-            
+            overlay_text: If set, burn this text into the still's top-left corner.
+
         Note:
             The creation process happens asynchronously. Call wait() to block
             until completion or check for errors.
@@ -632,16 +692,17 @@ class StillVideoCreator:
         file_name_still_video = Path(file_name_still_video)
         temp_frame = file_name_still_video.with_suffix('.frame.jpg')
         self.thread = threading.Thread(
-            target=self._run, 
-            args=(file_name_input_video, output_duration, file_name_still_video, temp_frame)
+            target=self._run,
+            args=(file_name_input_video, output_duration, file_name_still_video, temp_frame, overlay_text)
         )
         self.thread.start()
 
-    def _run(self, 
-             file_name_input_video: Union[str, Path], 
-             output_duration: float, 
+    def _run(self,
+             file_name_input_video: Union[str, Path],
+             output_duration: float,
              file_name_still_video: Union[str, Path],
-             still_image_file_name: Union[str, Path]) -> None:
+             still_image_file_name: Union[str, Path],
+             overlay_text: Optional[str]=None) -> None:
         """Background thread worker that creates the still video.
         
         Args:
@@ -687,7 +748,8 @@ class StillVideoCreator:
             FrameToVideo(
                 still_image_file_name, params_video, params_audio,
                 output_duration=output_duration,
-                file_name_output_video=file_name_still_video
+                file_name_output_video=file_name_still_video,
+                overlay_text=overlay_text,
             ).wait()
             
             # Verify still video was created
@@ -723,11 +785,85 @@ class StillVideoCreator:
     
     def wait(self) -> None:
         """Wait for the thread to complete and raise any exceptions.
-        
+
         Raises:
             Exception: Any exception that occurred during still video creation
         """
         self.thread.join()
         if self.exception:
             raise self.exception
+
+
+def burn_timestamp_into_clip(
+    input_clip: Union[str, Path], overlay_text: str, output_clip: Union[str, Path]
+) -> bool:
+    """Re-encode a motion clip with a burned-in timestamp, preserving its shape.
+
+    The publisher streams clips with -c:v copy, so a clip normally never gets
+    re-encoded. Burning text into the moving picture forces one -- so this is
+    the expensive path, gated behind timestamp_overlay.clip. To keep the concat
+    stream's RTSP SDP valid, the re-encode reproduces the clip's own
+    resolution, H264 profile and level exactly (the fields sdp_fields()
+    compares); audio is copied untouched, so its layout cannot drift either.
+    Only the video is re-encoded, and only to add the overlay.
+
+    Returns True on success. On any failure returns False and leaves no
+    partial output, so the caller falls back to streaming the original clip.
+    """
+    input_clip = Path(input_clip)
+    output_clip = Path(output_clip)
+
+    shape = probe_stream_shape(input_clip)
+    if shape is None:
+        log.warning(f"burn_timestamp_into_clip: cannot probe {input_clip}, skipping overlay")
+        return False
+
+    overlay_vf = _drawtext_filter(overlay_text)
+    if overlay_vf is None:
+        return False
+
+    cmd = [
+        'ffmpeg', *COMMON_FFMPEG_ARGS,
+        '-i', str(input_clip),
+        '-vf', overlay_vf,
+        '-c:v', 'libx264',
+        '-profile:v', str(shape['profile']),
+        '-level:v', str(shape['level']),
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'copy',
+        '-movflags', 'faststart',
+        str(output_clip),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        log.warning(f"burn_timestamp_into_clip: timed out on {input_clip}")
+        _unlink_quiet(output_clip)
+        return False
+    except Exception as e:
+        log.warning(f"burn_timestamp_into_clip: error on {input_clip}: {e}")
+        _unlink_quiet(output_clip)
+        return False
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+        log.warning(f"burn_timestamp_into_clip: ffmpeg failed (rc={result.returncode}): {stderr[:300]}")
+        _unlink_quiet(output_clip)
+        return False
+
+    if not output_clip.exists() or output_clip.stat().st_size == 0:
+        log.warning(f"burn_timestamp_into_clip: no output produced for {input_clip}")
+        _unlink_quiet(output_clip)
+        return False
+
+    return True
+
+
+def _unlink_quiet(path: Path) -> None:
+    """Delete a file, swallowing any error (best-effort cleanup)."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
     

@@ -17,7 +17,7 @@ from rich.logging import RichHandler
 
 from blinkbridge.blink import CameraManager
 from blinkbridge.config import *
-from blinkbridge.ffmpeg import probe_duration_seconds, probe_stream_shape
+from blinkbridge.ffmpeg import format_overlay_text, probe_duration_seconds, probe_stream_shape
 from blinkbridge.stream_server import StreamServer
 from blinkbridge.web import BlinkBridgeWebServer
 
@@ -621,7 +621,21 @@ class Application:
                 f"in {delay}s"
             )
 
-        ss.add_video(clip, defer_still=True)
+        # Optional timestamp burn-in of the clip's Blink-cloud recording time.
+        # camera_last_record holds the ISO time of the clip just fetched
+        # (set by check_for_motion); the recovery paths may not have it, in
+        # which case format_overlay_text returns None and no overlay is drawn.
+        overlay_cfg = CONFIG.get('timestamp_overlay', {})
+        still_text = clip_text = None
+        if overlay_cfg.get('still') or overlay_cfg.get('clip'):
+            cloud_time = self.cam_manager.camera_last_record.get(camera_name)
+            text = format_overlay_text(cloud_time, overlay_cfg.get('format', '%d.%m.%Y %H:%M:%S'))
+            if text:
+                still_text = text if overlay_cfg.get('still') else None
+                clip_text = text if overlay_cfg.get('clip') else None
+
+        ss.add_video(clip, defer_still=True,
+                     still_overlay_text=still_text, clip_overlay_text=clip_text)
 
         # Cancel any swap still pending from a previous clip: that still has
         # been replaced and swapping it in now would show stale footage.
