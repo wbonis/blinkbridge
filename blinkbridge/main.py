@@ -629,6 +629,13 @@ class Application:
         still_text = clip_text = None
         if overlay_cfg.get('still') or overlay_cfg.get('clip'):
             cloud_time = self.cam_manager.camera_last_record.get(camera_name)
+            if not cloud_time:
+                # Historical/recovery clips arrive via save_latest_clip, which
+                # never sets camera_last_record. Fall back to the cached clip's
+                # own timestamp so the very first still after a restart already
+                # carries a burned-in time instead of waiting for live motion.
+                media = self.cam_manager.clip_cache.get(camera_name) or {}
+                cloud_time = media.get('created_at') or media.get('time')
             text = format_overlay_text(cloud_time, overlay_cfg.get('format', '%d.%m.%Y %H:%M:%S'))
             if text:
                 still_text = text if overlay_cfg.get('still') else None
@@ -722,7 +729,17 @@ class Application:
 
         camera_name_sanitized = camera_name.replace(' ', '_').lower()
         shape_source = PATH_VIDEOS / f"{camera_name_sanitized}_latest.mp4"
-        if ss.refresh_still_from_image(image, shape_source):
+        # A snapshot is a fresh capture, so its "recording time" is now -- burn
+        # that in when the still overlay is on, so the looping still keeps
+        # showing a current time between motion events instead of dropping the
+        # timestamp the moment a snapshot refresh replaces the clip's still.
+        overlay_cfg = CONFIG.get('timestamp_overlay', {})
+        snap_overlay = None
+        if overlay_cfg.get('still'):
+            snap_overlay = format_overlay_text(
+                now.astimezone().isoformat(), overlay_cfg.get('format', '%d.%m.%Y %H:%M:%S')
+            )
+        if ss.refresh_still_from_image(image, shape_source, overlay_text=snap_overlay):
             log.info(f"{camera_name}: still refreshed from a new snapshot")
 
     async def _restart_failed_streams(self) -> None:

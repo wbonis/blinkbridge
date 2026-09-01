@@ -421,7 +421,8 @@ class StreamServer:
         return overlay_path
 
     def refresh_still_from_image(
-        self, image_file: Union[str, Path], shape_source: Union[str, Path]
+        self, image_file: Union[str, Path], shape_source: Union[str, Path],
+        overlay_text: Optional[str]=None
     ) -> bool:
         """Replace the looping still with one built from an arbitrary image.
 
@@ -466,6 +467,7 @@ class StreamServer:
                 image_file, params_video, params_audio,
                 output_duration=CONFIG['still_video_duration'],
                 file_name_output_video=next_still_video,
+                overlay_text=overlay_text,
             ).wait()
 
             if not next_still_video.exists() or next_still_video.stat().st_size == 0:
