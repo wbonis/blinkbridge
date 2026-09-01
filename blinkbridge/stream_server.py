@@ -62,6 +62,36 @@ class StreamServer:
         self._frozen_deleted_set: Optional[frozenset] = None
         self._frozen_since: Optional[datetime] = None
 
+    def _video_publish_args(self) -> list:
+        """Video args for the publisher: copy, or re-encode+downscale a camera.
+
+        A 1440p publisher cannot sustain delivery through the mediamtx->reader
+        pipe on this host -- frames stall to ~0 fps and Frigate sees no stream,
+        in every mediamtx timeout/queue configuration tried, while 720p flows
+        cleanly like every smaller camera. So a named camera can be capped:
+        cameras.transcode_max_height maps a camera name to a max height and the
+        publisher re-encodes that stream down to it. Unset cameras stay -c:v
+        copy (no CPU cost). The re-encode also makes the published SDP a fixed
+        720p regardless of the clip's own shape.
+        """
+        cams = CONFIG.get('cameras', {})
+        max_height = cams.get('transcode_max_height', {}).get(self.stream_name)
+        if not max_height:
+            return ['-c:v', 'copy']
+        # Cap output fps and use the fastest preset. Re-encoding 1440p->720p at
+        # the clip's native 25 fps could not keep up with -re realtime pacing on
+        # this 2-core host, so the publisher fell behind and mediamtx dropped it
+        # (broken pipe). A detector needs only a few fps, so a constant low fps
+        # makes the re-encode cheap and steady -- it never falls behind.
+        fps = int(cams.get('transcode_fps', 8))
+        return [
+            '-vf', f'scale=-2:{int(max_height)}',
+            '-r', str(fps),
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+            # Keyframe every ~2s so a reader can always start decoding quickly.
+            '-g', str(max(1, fps * 2)),
+        ]
+
     def _run_server(self) -> str:
         """Start the FFmpeg RTSP streaming process.
         
@@ -97,12 +127,20 @@ class StreamServer:
             # -flush_packets 0: it only held the still's last packets back
             # until clip packets pushed them out -- a burst at exactly the
             # transition that matters, for no benefit over TCP.
-            '-fflags', '+igndts+genpts',
+            # +discardcorrupt drops corrupt input packets instead of letting a
+            # bad frame stall the pipeline. Blink's 1440p clips occasionally
+            # carry a corrupt macroblock; under -c copy it passed through as a
+            # harmless artifact, but a re-encoding publisher must DECODE it, and
+            # the decoder stalling on it (error while decoding MB ...) paused
+            # output long enough for mediamtx to time out and drop the
+            # publisher. Skipping the bad packet keeps the stream flowing.
+            '-fflags', '+igndts+genpts+discardcorrupt',
+            '-err_detect', 'ignore_err',
             '-re',
             '-stream_loop', '-1',
             '-f', 'concat', '-safe', '0',
             '-i', str(input_concat_file.resolve()),
-            '-c:v', 'copy', '-c:a', 'copy',
+            *self._video_publish_args(), '-c:a', 'copy',
             # FFmpeg's RTSP muxer defaults to 1472-byte packets, above
             # MediaMTX's 1440 limit, so it logs "RTP packets are too big
             # (1460 > 1440), remuxing them into smaller ones" on every path and

@@ -1,52 +1,59 @@
 {
-    "still_video_duration": 0.5,
-    "still_video_fps": null,
-    "clip_repeats": 3,
-    "paths": {
-      "videos": "/working",
-      "concat": "/working",
-      "config": "/config"
-    },
-    "cameras": {
-      "enabled": [],
-      "disabled": [],
-      "max_failures": 3,
-      "restart_delay_seconds": 60
-    },
-    "blink": {
-      "login": {
-        "username": "",
-        "password": ""
-      },
-      "history_days": 90,
-      "poll_interval": 60,
-      "metadata_pages": 10
-    },
-    "rtsp_server": {
-      "address": "mediamtx",
-      "port": 8554
-    },
-    "frigate_export": {
-      "enabled": true,
-      "output_path": "/config/frigate_cameras.yml",
-      "rtsp_host": "mediamtx",
-      "rtsp_port": 8554,
-      "roles": ["detect", "record"],
-      "detect_defaults": {
-        "width": 1280,
-        "height": 720,
-        "fps": 1
-      }
-    },
-    "web": {
-      "enabled": true,
-      "host": "0.0.0.0",
-      "port": 8765
-    },
-    "snapshot_refresh": {
-      "enabled": false,
-      "default_interval_minutes": 0,
-      "per_camera": {}
-    },
-    "log_level": "INFO"
+ "still_video_duration": 0.5,
+ "still_video_fps": null,
+ "clip_repeats": 3,
+ "paths": {
+  "videos": "/working",
+  "concat": "/working",
+  "config": "/config"
+ },
+ "cameras": {
+  "enabled": [],
+  "disabled": [],
+  "max_failures": 3,
+  "restart_delay_seconds": 60,
+  "transcode_max_height": {
+   "Blink2": 720
+  },
+  "transcode_fps": 8
+ },
+ "blink": {
+  "login": {
+   "username": "",
+   "password": ""
+  },
+  "history_days": 90,
+  "poll_interval": 60,
+  "metadata_pages": 10
+ },
+ "rtsp_server": {
+  "address": "mediamtx",
+  "port": 8554
+ },
+ "frigate_export": {
+  "enabled": true,
+  "output_path": "/config/frigate_cameras.yml",
+  "rtsp_host": "mediamtx",
+  "rtsp_port": 8554,
+  "roles": [
+   "detect",
+   "record"
+  ],
+  "detect_defaults": {
+   "width": 1280,
+   "height": 720,
+   "fps": 1
+  }
+ },
+ "web": {
+  "enabled": true,
+  "host": "0.0.0.0",
+  "port": 8765
+ },
+ "snapshot_refresh": {
+  "enabled": false,
+  "default_interval_minutes": 0,
+  "per_camera": {}
+ },
+ "log_level": "INFO"
 }

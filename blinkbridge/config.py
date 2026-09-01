@@ -150,6 +150,12 @@ def load_config_file(file_name: Union[str, Path]) -> None:
         CONFIG['cameras'].setdefault('enabled', [])
         CONFIG['cameras'].setdefault('disabled', [])
         CONFIG['cameras'].setdefault('max_failures', 3)
+        # Per-camera publish downscale, {camera_name: max_height}. A camera
+        # whose native resolution is too high to sustain through the
+        # mediamtx->reader pipe (1440p stalls to ~0 fps on this host) is
+        # re-encoded down to the given height by the publisher; cameras absent
+        # here keep -c:v copy. See StreamServer._video_publish_args.
+        CONFIG['cameras'].setdefault('transcode_max_height', {})
         CONFIG['blink'].setdefault('history_days', 90)
         CONFIG['blink'].setdefault('poll_interval', 1)
         CONFIG['blink'].setdefault('metadata_pages', 10)
