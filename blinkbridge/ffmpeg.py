@@ -472,6 +472,11 @@ class VideoToLastFrame:
 
         ffmpeg_params = [
             'ffmpeg', *COMMON_FFMPEG_ARGS,
+            # Blink's higher-res clips carry an occasional corrupt frame; a
+            # no-op on clean input, but if the last frame region is the bad one,
+            # skipping it lets an earlier good frame become the still instead of
+            # the decode erroring out. Same guard the re-encoding publisher uses.
+            '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt',
             '-sseof', str(-time_offset_from_end),
             '-i', str(input_video),
             '-update', '1',  # Update output file with each frame
