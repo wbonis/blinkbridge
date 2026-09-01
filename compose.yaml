@@ -43,15 +43,7 @@ services:
       # RTP packets can overflow the default queue in one burst, which MediaMTX
       # reports as "reader is too slow, discarding N frames" against the
       # Frigate readers. To revert, drop this line.
-      - MTX_WRITEQUEUESIZE=8192
-      # 2026-09-02: mediamtx was silently closing the healthy 1440p
-      # blink2 publisher (CLOSE_WAIT, no log) ~every 40-53s -> broken
-      # pipe. Default read/write timeout is 10s; a 1440p keyframe burst
-      # under a slow reader can stall the path past that and mediamtx
-      # guillotines the publisher. 720p never stalls that long. Raise
-      # both to 60s. To revert, drop these two lines.
-      - MTX_READTIMEOUT=60s
-      - MTX_WRITETIMEOUT=60s
+      - MTX_WRITEQUEUESIZE=2048
       - TZ=Europe/Berlin
     volumes:
       # This image carries no zoneinfo of its own, so TZ alone would leave its
