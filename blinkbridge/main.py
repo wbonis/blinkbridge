@@ -299,7 +299,14 @@ class Application:
             # guess. detect fps stays configured: that's Frigate's analysis
             # rate, not the stream's.
             shape = probe_stream_shape(PATH_VIDEOS / f"{camera_key}_latest.mp4")
-            if shape is not None:
+            max_height = CONFIG['cameras'].get('transcode_max_height', {}).get(camera_name)
+            if shape is not None and max_height:
+                # The publisher re-encodes this camera down to max_height
+                # (scale=-2:H keeps the aspect ratio, width rounded to even),
+                # so that, not the clip's own size, is what Frigate receives.
+                cam_height = int(max_height)
+                cam_width = int(round(shape['width'] * cam_height / shape['height'] / 2)) * 2
+            elif shape is not None:
                 cam_width, cam_height = shape['width'], shape['height']
             else:
                 cam_width, cam_height = width, height

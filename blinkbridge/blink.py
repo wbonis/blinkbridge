@@ -22,6 +22,7 @@ from blinkbridge.config import *
 from blinkbridge.ffmpeg import (
     generate_placeholder_video,
     is_usable_clip,
+    normalize_clip_container,
     probe_stream_shape,
     sdp_fields,
 )
@@ -281,6 +282,7 @@ class CameraManager:
             '-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1',
             '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k',
             '-t', str(duration), '-pix_fmt', 'yuv420p', '-movflags', 'faststart',
+            '-video_track_timescale', str(CONCAT_VIDEO_TIMESCALE),
             str(black_video_path)
         ]
         
@@ -720,6 +722,14 @@ class CameraManager:
                 # local failure: it mis-describes the stream for as long as the
                 # publisher runs.
                 if is_usable_clip(file_name):
+                    # A clip left by an older version may still be in Blink's
+                    # native container; bring it in line before it seeds the
+                    # stream (no-op when it already is).
+                    if not normalize_clip_container(file_name):
+                        log.warning(
+                            f"{camera_name}: could not normalize cached clip {file_name.name}; "
+                            f"streaming it as-is may stall the stream"
+                        )
                     log.debug(f"{camera_name}: skipping download, {file_name} exists")
                     return file_name
                 log.warning(
@@ -768,6 +778,7 @@ class CameraManager:
                 if not tmp_name.exists() or tmp_name.stat().st_size == 0:
                     raise IOError("Failed to write video file")
 
+                self._normalize_downloaded_clip(camera_name, tmp_name)
                 os.replace(tmp_name, file_name)
             except BaseException:
                 try:
@@ -793,6 +804,22 @@ class CameraManager:
 
         return None
     
+    @staticmethod
+    def _normalize_downloaded_clip(camera_name: str, clip: Path) -> None:
+        """Rewrite a freshly downloaded clip's container for the concat stream.
+
+        Blink serves clips with 1/1000 time bases; the concat demuxer needs
+        every file in a stream to share one (see CONCAT_VIDEO_TIMESCALE), so
+        this runs on the temp file before it is renamed into place. Failure is
+        logged, not raised: a clip in the wrong container plays, just with
+        stalls at its edges, which beats losing the motion footage.
+        """
+        if not normalize_clip_container(clip):
+            log.warning(
+                f"{camera_name}: could not normalize downloaded clip container; "
+                f"streaming it as-is may stall the stream"
+            )
+
     async def _save_clip(self, camera_name: str, url: str, file_name: Path) -> None:
         """Save a video clip from URL to file.
         
@@ -836,6 +863,7 @@ class CameraManager:
                 if not tmp_name.exists() or tmp_name.stat().st_size == 0:
                     raise IOError("Failed to write video file or file is empty")
 
+                self._normalize_downloaded_clip(camera_name, tmp_name)
                 os.replace(tmp_name, file_name)
             except BaseException:
                 try:
@@ -941,6 +969,7 @@ class CameraManager:
                 if not tmp_name.exists() or tmp_name.stat().st_size == 0:
                     raise IOError("video file not created or is empty")
 
+                self._normalize_downloaded_clip(camera_name, tmp_name)
                 os.replace(tmp_name, file_name)
             except BaseException:
                 try:

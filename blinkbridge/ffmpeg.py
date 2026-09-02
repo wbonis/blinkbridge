@@ -9,6 +9,7 @@ Provides classes for interacting with FFmpeg and FFprobe to:
 """
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -138,7 +139,110 @@ def probe_stream_shape(video_file: Union[str, Path]) -> Optional[Dict]:
         'level': level,
         'audio_rate': int(params_audio.get('sample_rate', 44100)) if params_audio else 44100,
         'audio_channels': int(params_audio.get('channels', 2)) if params_audio else 2,
+        'video_timescale': _timescale(params_video.get('time_base')),
     }
+
+
+def _timescale(time_base: Optional[str]) -> Optional[int]:
+    """Denominator of an ffprobe time_base such as '1/90000', or None."""
+    try:
+        num, den = str(time_base).split('/')
+        return int(den) if int(num) == 1 else None
+    except (AttributeError, ValueError):
+        return None
+
+
+def has_canonical_timebases(video_file: Union[str, Path]) -> Optional[bool]:
+    """Whether a file's tracks carry the time bases the concat stream uses.
+
+    Video must be 1/CONCAT_VIDEO_TIMESCALE and audio 1/<sample rate>, which is
+    what normalize_clip_container() produces and what every generated file is
+    written with. Returns None if the file cannot be probed.
+    """
+    try:
+        params_audio, params_video = StreamParameters(video_file).wait()
+    except Exception as e:
+        log.debug(f"has_canonical_timebases: cannot probe {video_file}: {e}")
+        return None
+    if not params_video:
+        return None
+    if _timescale(params_video.get('time_base')) != CONCAT_VIDEO_TIMESCALE:
+        return False
+    if params_audio:
+        try:
+            rate = int(params_audio.get('sample_rate'))
+        except (TypeError, ValueError):
+            return False
+        if _timescale(params_audio.get('time_base')) != rate:
+            return False
+    return True
+
+
+def normalize_clip_container(video_file: Union[str, Path]) -> bool:
+    """Remux a clip in place so its time bases match the concat stream's.
+
+    Streams are untouched (-c copy); only the MP4 container is rewritten with
+    the video track at CONCAT_VIDEO_TIMESCALE, which also gives the audio track
+    the sample-rate timescale the muxer always uses. See CONCAT_VIDEO_TIMESCALE
+    for why a clip must not enter a concat stream in Blink's native container.
+
+    A file that already matches is left alone. The rewrite goes to a sibling
+    temp file and is renamed into place, so a publisher that has the old file
+    open keeps reading it unharmed.
+
+    Returns True if the file now has canonical time bases, False if it could
+    not be probed or remuxed (the original is left in place either way).
+    """
+    video_file = Path(video_file)
+    state = has_canonical_timebases(video_file)
+    if state is None:
+        return False
+    if state:
+        return True
+
+    tmp_file = video_file.with_name(video_file.name + '.remux.mp4')
+    cmd = [
+        'ffmpeg', *COMMON_FFMPEG_ARGS,
+        '-i', str(video_file),
+        '-c', 'copy',
+        '-video_track_timescale', str(CONCAT_VIDEO_TIMESCALE),
+        '-movflags', 'faststart',
+        str(tmp_file),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        log.warning(f"normalize_clip_container: timed out on {video_file}")
+        _unlink_quiet(tmp_file)
+        return False
+    except Exception as e:
+        log.warning(f"normalize_clip_container: error on {video_file}: {e}")
+        _unlink_quiet(tmp_file)
+        return False
+
+    if result.returncode != 0 or not tmp_file.exists() or tmp_file.stat().st_size == 0:
+        stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+        log.warning(
+            f"normalize_clip_container: ffmpeg failed on {video_file} "
+            f"(rc={result.returncode}): {stderr[:300]}"
+        )
+        _unlink_quiet(tmp_file)
+        return False
+
+    if not has_canonical_timebases(tmp_file):
+        log.warning(f"normalize_clip_container: remux of {video_file} still has odd time bases")
+        _unlink_quiet(tmp_file)
+        return False
+
+    try:
+        os.replace(tmp_file, video_file)
+    except OSError as e:
+        log.warning(f"normalize_clip_container: cannot replace {video_file}: {e}")
+        _unlink_quiet(tmp_file)
+        return False
+
+    log.debug(f"normalize_clip_container: remuxed {video_file.name} to timescale {CONCAT_VIDEO_TIMESCALE}")
+    return True
 
 
 def probe_duration_seconds(video_file: Union[str, Path]) -> Optional[float]:
@@ -207,11 +311,18 @@ def sdp_fields(shape: Dict) -> tuple:
     clip as a new stream. Compare these fields instead wherever the question is
     "does this still describe the same stream", and use the full shape only
     where the value is actually needed, such as encoder flags.
+
+    The video timescale is not in the SDP either, but it is compared here
+    because the concat demuxer applies the first file's time base to every
+    later file without rescaling (see CONCAT_VIDEO_TIMESCALE): a file with a
+    different timescale cannot share the stream any more than one with a
+    different resolution can.
     """
     return (
         shape['width'], shape['height'],
         shape['profile'], shape['level'],
         shape['audio_rate'], shape['audio_channels'],
+        shape.get('video_timescale'),
     )
 
 
@@ -228,6 +339,7 @@ def generate_placeholder_video(
     level: str = '4.1',
     audio_rate: int = 44100,
     audio_channels: int = 2,
+    video_timescale: int = CONCAT_VIDEO_TIMESCALE,
 ) -> bool:
     """Generate a short placeholder video with a solid background and centered text.
 
@@ -258,6 +370,8 @@ def generate_placeholder_video(
         level: H264 level, as FFmpeg spells it, e.g. '4.0' (default: '4.1').
         audio_rate: Audio sample rate in Hz (default: 44100).
         audio_channels: Audio channel count (default: 2).
+        video_timescale: MP4 video track timescale; must match the clips the
+            placeholder shares a concat stream with (see CONCAT_VIDEO_TIMESCALE).
 
     Returns:
         True if the video was created successfully, False otherwise.
@@ -295,6 +409,7 @@ def generate_placeholder_video(
         '-c:a', 'aac', '-ar', str(audio_rate), '-ac', str(audio_channels), '-b:a', '64k',
         '-t', str(duration),
         '-movflags', 'faststart',
+        '-video_track_timescale', str(video_timescale or CONCAT_VIDEO_TIMESCALE),
     ]
 
     if vf:
@@ -837,6 +952,7 @@ def burn_timestamp_into_clip(
         '-pix_fmt', 'yuv420p',
         '-c:a', 'copy',
         '-movflags', 'faststart',
+        '-video_track_timescale', str(CONCAT_VIDEO_TIMESCALE),
         str(output_clip),
     ]
 

@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     'COMMON_FFMPEG_ARGS',
+    'CONCAT_VIDEO_TIMESCALE',
     'CONFIG',
     'DELAY_RESTART',
     'RTSP_URL',
@@ -27,6 +28,22 @@ __all__ = [
 
 # Common FFmpeg arguments used across all FFmpeg operations
 COMMON_FFMPEG_ARGS = ['-hide_banner', '-loglevel', 'error', '-y']
+
+# MP4 video track timescale every file in a camera's concat stream is written
+# with. FFmpeg's concat demuxer takes each stream's time_base from the FIRST
+# file it opens and applies it to every later file's packets WITHOUT rescaling
+# (the docs say "all files must have the same streams (same codecs, same time
+# base, etc.)"). Blink's own clips use 1/1000 while anything FFmpeg writes
+# defaults to something else (12800, 16000, 90000 ...), so a still played after
+# an unconverted clip had its timestamps read in the wrong unit -- audio came
+# out 16x too far in the future, -re slept on it, and the stream stalled for
+# seconds at every still loop. So downloaded clips are remuxed to this
+# timescale and every generated file (still, placeholder, overlay clip) is
+# written with it. Audio needs no equivalent: the MP4 muxer always writes the
+# audio timescale as the sample rate, which the same remux gives clips too.
+# 90000 is the RTP clock H264 travels in anyway, so every frame rate Blink
+# produces is exact in it.
+CONCAT_VIDEO_TIMESCALE = 90000
 
 # Global configuration dictionary loaded from JSON file
 CONFIG = None
