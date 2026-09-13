@@ -20,6 +20,7 @@ from blinkpy.helpers.util import json_load
 
 from blinkbridge.config import *
 from blinkbridge.ffmpeg import (
+    conform_clip,
     generate_placeholder_video,
     is_usable_clip,
     normalize_clip_container,
@@ -722,14 +723,12 @@ class CameraManager:
                 # local failure: it mis-describes the stream for as long as the
                 # publisher runs.
                 if is_usable_clip(file_name):
-                    # A clip left by an older version may still be in Blink's
-                    # native container; bring it in line before it seeds the
-                    # stream (no-op when it already is).
-                    if not normalize_clip_container(file_name):
-                        log.warning(
-                            f"{camera_name}: could not normalize cached clip {file_name.name}; "
-                            f"streaming it as-is may stall the stream"
-                        )
+                    # A clip left by an older version (or a newer camera whose
+                    # height cap changed) may still be full-resolution or in
+                    # Blink's native container; conform it before it seeds the
+                    # stream (no-op when it already matches). This also self-heals
+                    # an oversized _latest.mp4 on the next poll after a restart.
+                    self._normalize_downloaded_clip(camera_name, file_name)
                     log.debug(f"{camera_name}: skipping download, {file_name} exists")
                     return file_name
                 log.warning(
@@ -805,18 +804,30 @@ class CameraManager:
         return None
     
     @staticmethod
-    def _normalize_downloaded_clip(camera_name: str, clip: Path) -> None:
-        """Rewrite a freshly downloaded clip's container for the concat stream.
+    def _clip_height_cap(camera_name: str) -> Optional[int]:
+        """This camera's cameras.transcode_max_height, or None if uncapped."""
+        try:
+            cap = CONFIG.get('cameras', {}).get('transcode_max_height', {}).get(camera_name)
+            return int(cap) if cap else None
+        except (TypeError, ValueError):
+            return None
 
-        Blink serves clips with 1/1000 time bases; the concat demuxer needs
-        every file in a stream to share one (see CONCAT_VIDEO_TIMESCALE), so
-        this runs on the temp file before it is renamed into place. Failure is
-        logged, not raised: a clip in the wrong container plays, just with
-        stalls at its edges, which beats losing the motion footage.
+    @classmethod
+    def _normalize_downloaded_clip(cls, camera_name: str, clip: Path) -> None:
+        """Make a freshly downloaded clip cheap and safe to stream.
+
+        Two things must be true before a clip enters the concat stream: its time
+        bases must match the stream's (see CONCAT_VIDEO_TIMESCALE), and a
+        height-capped camera's clip must already be at that height so the
+        publisher does not decode a huge source on every frame under -re (a
+        2560x1440@60 clip re-encoded live could not hold realtime on this host
+        and dropped the publisher in a loop). conform_clip() does both, once,
+        here on the temp file before the atomic rename. Failure is logged, not
+        raised: a clip streamed as-is beats losing the motion footage.
         """
-        if not normalize_clip_container(clip):
+        if not conform_clip(clip, cls._clip_height_cap(camera_name)):
             log.warning(
-                f"{camera_name}: could not normalize downloaded clip container; "
+                f"{camera_name}: could not conform downloaded clip; "
                 f"streaming it as-is may stall the stream"
             )
 

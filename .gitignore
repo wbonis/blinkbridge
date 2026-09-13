@@ -45,3 +45,16 @@ __pycache__
 # Config
 config/config.json
 config/clip_cache.json
+
+# Local deployment data: never commit credentials, generated media, or backups.
+/working/
+/config/*
+!/config/*.example
+!/config/*.example-full
+/.claude/
+.env
+.env.*
+*.bak
+*.bak-*
+*.backup
+*.log

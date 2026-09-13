@@ -152,6 +152,33 @@ def _timescale(time_base: Optional[str]) -> Optional[int]:
         return None
 
 
+def libx264_profile(profile):
+    """Map an ffprobe H264 profile name to a value libx264 -profile:v accepts.
+
+    ffprobe reports names like "Constrained Baseline", "High", "Main"; libx264
+    accepts only baseline, main, high, high10, high422, high444. The generators
+    re-encode a still/placeholder/overlay to match the clip they share a concat
+    stream with, and used to feed the probed name straight back -- fine while
+    Blink's clips were "High", but a clip re-encoded to a baseline profile broke
+    it ("x264 [error]: invalid profile: Constrained Baseline"). Normalising here
+    keeps every derived file encodable and still matching the clip's profile.
+    """
+    n = str(profile or '').lower().replace(' ', '').replace('-', '')
+    if 'high444' in n:
+        return 'high444'
+    if 'high422' in n:
+        return 'high422'
+    if 'high10' in n:
+        return 'high10'
+    if 'high' in n:
+        return 'high'
+    if 'main' in n:
+        return 'main'
+    if 'baseline' in n:
+        return 'baseline'
+    return 'high'
+
+
 def has_canonical_timebases(video_file: Union[str, Path]) -> Optional[bool]:
     """Whether a file's tracks carry the time bases the concat stream uses.
 
@@ -242,6 +269,100 @@ def normalize_clip_container(video_file: Union[str, Path]) -> bool:
         return False
 
     log.debug(f"normalize_clip_container: remuxed {video_file.name} to timescale {CONCAT_VIDEO_TIMESCALE}")
+    return True
+
+
+def conform_clip(video_file: Union[str, Path], max_height: Optional[int] = None) -> bool:
+    """Make a downloaded clip cheap and safe to stream, in place.
+
+    Two jobs, one pass:
+    - If the camera is height-capped (cameras.transcode_max_height) and the clip
+      is taller, downscale it to that height NOW, once, at ~9x realtime. The
+      publisher streams with -c copy-equivalent cost afterwards instead of
+      decoding the full-resolution source on every frame under -re forever.
+      On this 2-core host a 2560x1440@60 source re-encoded live sat at ~1.0x
+      speed and fell behind under any contention, dropping the publisher
+      (broken pipe) and looping restarts; a 720p source does not.
+    - Otherwise (or once downscaled) ensure the container time bases match the
+      concat stream (see normalize_clip_container / CONCAT_VIDEO_TIMESCALE).
+
+    Downscaling re-encodes video (libx264, capped fps) and passes audio through
+    ffmpeg's mp4 muxer, which rewrites the audio timescale to the sample rate --
+    the same value the stills carry -- so a downscaled clip still shares time
+    bases with everything else in the stream. Written to a sibling temp file and
+    renamed into place, so a publisher holding the old file open is undisturbed.
+
+    Returns True on success (file now conformed), False on any failure (original
+    left in place; caller streams it as-is).
+    """
+    video_file = Path(video_file)
+    shape = probe_stream_shape(video_file)
+    if shape is None:
+        return False
+
+    try:
+        cap = int(max_height) if max_height else 0
+    except (TypeError, ValueError):
+        cap = 0
+
+    # No downscale needed: just make the container canonical.
+    if not cap or int(shape['height']) <= cap:
+        return normalize_clip_container(video_file)
+
+    fps = 8
+    try:
+        fps = max(1, int(CONFIG.get('cameras', {}).get('transcode_fps', 8)))
+    except (TypeError, ValueError):
+        pass
+
+    tmp_file = video_file.with_name(video_file.name + '.conform.mp4')
+    cmd = [
+        'ffmpeg', *COMMON_FFMPEG_ARGS,
+        '-fflags', '+igndts+genpts+discardcorrupt', '-err_detect', 'ignore_err',
+        '-i', str(video_file),
+        '-vf', f'scale=-2:{cap}',
+        '-r', str(fps),
+        # ultrafast tags the output "Constrained Baseline" whatever -profile:v
+        # asks for (the preset uses baseline tools), so don't fight it here --
+        # the still/placeholder/overlay generators normalise the probed profile
+        # via libx264_profile() so a baseline clip is fine downstream.
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+        '-g', str(fps * 2),
+        '-c:a', 'copy',
+        '-movflags', 'faststart',
+        '-video_track_timescale', str(CONCAT_VIDEO_TIMESCALE),
+        str(tmp_file),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        log.warning(f"conform_clip: timed out downscaling {video_file}")
+        _unlink_quiet(tmp_file)
+        return False
+    except Exception as e:
+        log.warning(f"conform_clip: error downscaling {video_file}: {e}")
+        _unlink_quiet(tmp_file)
+        return False
+
+    if result.returncode != 0 or not tmp_file.exists() or tmp_file.stat().st_size == 0:
+        stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+        log.warning(f"conform_clip: ffmpeg failed on {video_file} (rc={result.returncode}): {stderr[:300]}")
+        _unlink_quiet(tmp_file)
+        return False
+
+    if probe_stream_shape(tmp_file) is None:
+        log.warning(f"conform_clip: downscaled {video_file} is unreadable")
+        _unlink_quiet(tmp_file)
+        return False
+
+    try:
+        os.replace(tmp_file, video_file)
+    except OSError as e:
+        log.warning(f"conform_clip: cannot replace {video_file}: {e}")
+        _unlink_quiet(tmp_file)
+        return False
+
+    log.info(f"conform_clip: downscaled {video_file.name} to {cap}p @ {fps}fps for streaming")
     return True
 
 
@@ -404,7 +525,7 @@ def generate_placeholder_video(
         '-f', 'lavfi', '-i', f"color={bg_color}:size={width}x{height}:rate={fps}",
         '-f', 'lavfi',
         '-i', f"anullsrc=channel_layout={channel_layout}:sample_rate={audio_rate}",
-        '-c:v', 'libx264', '-profile:v', str(profile), '-level:v', str(level),
+        '-c:v', 'libx264', '-profile:v', libx264_profile(profile), '-level:v', str(level),
         '-pix_fmt', 'yuv420p', '-b:v', '500k',
         '-c:a', 'aac', '-ar', str(audio_rate), '-ac', str(audio_channels), '-b:a', '64k',
         '-t', str(duration),
@@ -735,7 +856,7 @@ class FrameToVideo:
             '-t', str(output_duration),
             '-vf', vf,
             '-b:v', params_video['bit_rate'],
-            '-profile:v', params_video['profile'],
+            '-profile:v', libx264_profile(params_video['profile']),
             '-level:v', params_video['level'],
             '-movflags', 'faststart',
             '-video_track_timescale', time_base_denominator,
@@ -947,7 +1068,7 @@ def burn_timestamp_into_clip(
         '-i', str(input_clip),
         '-vf', overlay_vf,
         '-c:v', 'libx264',
-        '-profile:v', str(shape['profile']),
+        '-profile:v', libx264_profile(shape['profile']),
         '-level:v', str(shape['level']),
         '-pix_fmt', 'yuv420p',
         '-c:a', 'copy',

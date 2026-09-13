@@ -17,6 +17,7 @@ from blinkbridge.ffmpeg import (
     StillVideoCreator,
     StreamParameters,
     burn_timestamp_into_clip,
+    probe_duration_seconds,
     probe_stream_shape,
     sdp_fields,
 )
@@ -63,26 +64,41 @@ class StreamServer:
         self._frozen_since: Optional[datetime] = None
 
     def _video_publish_args(self) -> list:
-        """Video args for the publisher: copy, or re-encode+downscale a camera.
+        """Video args for the publisher: copy, with a re-encode downscale fallback.
 
-        A 1440p publisher cannot sustain delivery through the mediamtx->reader
-        pipe on this host -- frames stall to ~0 fps and Frigate sees no stream,
-        in every mediamtx timeout/queue configuration tried, while 720p flows
-        cleanly like every smaller camera. So a named camera can be capped:
-        cameras.transcode_max_height maps a camera name to a max height and the
-        publisher re-encodes that stream down to it. Unset cameras stay -c:v
-        copy (no CPU cost). The re-encode also makes the published SDP a fixed
-        720p regardless of the clip's own shape.
+        The publisher must not re-encode in its steady state. Re-encoding under
+        -re realtime pacing on this 2-core host sits right at 1.0x speed and
+        falls behind the moment anything else needs CPU -- a still being built,
+        the other camera, a snapshot refresh -- and mediamtx then drops the slow
+        publisher (broken pipe), which the watchdog restarts, in a loop every
+        ~60s. A plain -c copy publisher (what every uncapped camera, e.g. blink1,
+        already uses) never falls behind because it decodes nothing, and stays up
+        for hours through the same events.
+
+        A height-capped camera (cameras.transcode_max_height) is made copyable by
+        downscaling its CLIPS once at download time (see ffmpeg.conform_clip), so
+        by the time they reach here they are already at the cap and copy is
+        correct. The re-encode branch below survives only as a fallback for the
+        rare clip that reached the stream larger than the cap (a conform that
+        failed): without it a stray oversized file would seed a too-large SDP and
+        stall every reader. In the normal case it is never taken.
         """
         cams = CONFIG.get('cameras', {})
         max_height = cams.get('transcode_max_height', {}).get(self.stream_name)
         if not max_height:
             return ['-c:v', 'copy']
-        # Cap output fps and use the fastest preset. Re-encoding 1440p->720p at
-        # the clip's native 25 fps could not keep up with -re realtime pacing on
-        # this 2-core host, so the publisher fell behind and mediamtx dropped it
-        # (broken pipe). A detector needs only a few fps, so a constant low fps
-        # makes the re-encode cheap and steady -- it never falls behind.
+        # Clips are pre-downscaled to the cap, so copy unless one slipped through
+        # larger -- decided from the file that actually seeds the stream.
+        shape = probe_stream_shape(PATH_VIDEOS / f"{self.stream_name_sanitized}_latest.mp4")
+        if shape is None or int(shape['height']) <= int(max_height):
+            return ['-c:v', 'copy']
+        log.warning(
+            f"{self.stream_name}: clip is {shape['height']}p, above the {max_height}p "
+            f"cap -- falling back to a live re-encode (conform_clip should have "
+            f"prevented this)"
+        )
+        # Fallback only. Cap fps and use the fastest preset to keep the emergency
+        # re-encode as light as possible.
         fps = int(cams.get('transcode_fps', 8))
         return [
             '-vf', f'scale=-2:{int(max_height)}',
@@ -241,6 +257,32 @@ class StreamServer:
         
         next_concat = PATH_CONCAT / f"{self.stream_name_sanitized}_next.concat"
 
+        # The file's length MUST be declared to the concat demuxer. The outer
+        # script lists this nested script twice and the publisher loops it, so
+        # the demuxer computes the second entry's start time as
+        # first.start_time + first.duration. For a nested script without a
+        # declared duration it measures that length ONCE, on the first pass
+        # (the 2 s starting placeholder), and never again: from then on entry
+        # two always starts 2 s after entry one, whatever is actually queued.
+        # A 15 s clip in entry one followed by the 2 s still in entry two then
+        # ends the pass at t+15 but the still is stamped t+2..t+4, and the next
+        # loop resumes at t+15 -- an 11 s forward jump. ffmpeg's -re pacing
+        # sleeps through forward jumps; mediamtx drops a publisher that sends
+        # nothing for 10 s, so the publisher dies ("Broken pipe") every time
+        # the swap lands in that phase (about every other clip). The mirror
+        # case, a clip in entry two, jumps 13 s backwards and hands readers 13
+        # s of clamped, frozen RTP timestamps ("reader is too slow", go2rtc
+        # i/o timeouts). With the duration declared, the nested script has a
+        # known length and the demuxer recomputes the offsets on every open,
+        # so every boundary is continuous. Reproduced and verified against
+        # ffmpeg 8.1.2 (2026-09-02) with a dynamic two-entry loop simulation.
+        duration = probe_duration_seconds(video_file_name)
+        if not duration:
+            log.warning(
+                f"{self.stream_name}: cannot measure {video_file_name.name}; "
+                f"queuing it without a duration, the stream may stall at its edges"
+            )
+
         try:
             # Written beside the target and renamed into place. The publisher
             # re-parses this file at every concat entry boundary -- with a 2 s
@@ -253,6 +295,8 @@ class StreamServer:
             with open(tmp_concat, 'w') as f:
                 f.write("ffconcat version 1.0\n")
                 f.write(f"file '{video_file_name.resolve()}'\n")
+                if duration:
+                    f.write(f"duration {duration:.6f}\n")
             os.replace(tmp_concat, next_concat)
         except IOError as e:
             log.error(f"{self.stream_name}: failed to write next concat file: {e}")
